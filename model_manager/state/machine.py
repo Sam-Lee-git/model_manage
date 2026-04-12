@@ -26,7 +26,7 @@ TRANSITIONS = [
     {"trigger": "deps_installed",      "source": SessionState.INSTALLING_DEPENDENCIES, "dest": SessionState.DOWNLOADING_MODEL},
     {"trigger": "download_complete",   "source": SessionState.DOWNLOADING_MODEL,       "dest": SessionState.VERIFYING_INSTALL},
     {"trigger": "verified",            "source": SessionState.VERIFYING_INSTALL,       "dest": SessionState.COMPLETED},
-    # Error recovery (from any active state)
+    # Error recovery (from any active state, including re-entry from ERROR_RECOVERY after user retry)
     {
         "trigger": "error_captured",
         "source": [
@@ -40,6 +40,7 @@ TRANSITIONS = [
             SessionState.INSTALLING_DEPENDENCIES,
             SessionState.DOWNLOADING_MODEL,
             SessionState.VERIFYING_INSTALL,
+            SessionState.ERROR_RECOVERY,   # allow re-diagnosis when user-assisted retry also fails
         ],
         "dest": SessionState.ERROR_RECOVERY,
     },

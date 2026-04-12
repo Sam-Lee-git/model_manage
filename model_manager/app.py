@@ -404,6 +404,10 @@ class App:
                             step, diagnosis, state
                         )
                         if should_retry:
+                            # Exit ERROR_RECOVERY → INSTALLING_DEPENDENCIES so next
+                            # failure can re-enter error_captured cleanly
+                            sm.set_resume_target(SessionState.INSTALLING_DEPENDENCIES)
+                            await sm.trigger("branch_verified")
                             continue
                         await sm.trigger("branch_needs_user")
                         return
@@ -414,6 +418,8 @@ class App:
                         step, diagnosis, state
                     )
                     if should_retry:
+                        sm.set_resume_target(SessionState.INSTALLING_DEPENDENCIES)
+                        await sm.trigger("branch_verified")
                         continue
                     await sm.trigger("branch_fatal")
                     return
