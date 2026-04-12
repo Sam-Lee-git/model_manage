@@ -30,7 +30,20 @@ Respond ONLY with valid JSON matching this schema:
   "decision_options": []
 }
 
+Valid error_category values: network, dependency_conflict, cuda_mismatch, permission, disk_space, auth_error, unknown.
+
 Be precise. Generate commands that will actually work on the detected OS and Python version.
 For CUDA issues: check driver version, suggest correct torch wheel URL.
 For network issues: suggest mirrors, proxy settings, or offline alternatives.
 For dependency conflicts: suggest version pins or virtual environment recreation.
+
+CRITICAL — HuggingFace authentication errors (401 / "Repository Not Found" / "Invalid username or password"):
+- error_category must be "auth_error"
+- requires_user_decision must be true
+- decision_options must list the manual steps the user must take in a browser:
+    ["Accept the model license at https://huggingface.co/<model_id>",
+     "Create a read-scope token at https://huggingface.co/settings/tokens"]
+- fix_plan step to set the token must use action_type "modify_env_var", NOT "run_command":
+    {"action_type": "modify_env_var", "action_params": {"key": "HF_TOKEN", "value": "PLACEHOLDER_ENTER_TOKEN"}}
+- Do NOT generate PowerShell or shell commands that write the token to disk; use modify_env_var only.
+- alternative_plans should be empty [] for auth errors — the user must supply the token manually.

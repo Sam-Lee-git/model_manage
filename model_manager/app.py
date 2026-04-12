@@ -142,40 +142,25 @@ class App:
             await sm.trigger("model_selected")
             return
 
-        # Build recommendations
-        if self._hardware:
-            recommender = ModelRecommender(self._catalog)
-            recs = recommender.recommend(self._hardware)
-            summary_lines = []
-            for i, r in enumerate(recs, 1):
-                q = r.best_quant
-                qstr = f"  [{q.quant_type}, {q.file_size_gb:.1f}GB]" if q else ""
-                summary_lines.append(
-                    f"  {i}. [model]{r.model.display_name}[/model]{qstr} — {r.reason}"
-                )
-            rec_text = "\n".join(summary_lines)
-        else:
-            rec_text = "  (No hardware info — showing all models)"
+        # Build system prompt with hardware + catalog injected
+        system_prompt = self._build_recommendation_system_prompt()
 
         # Try to use Claude for conversation; fall back to simple input
         try:
             self._conversation = ConversationManager()
-            hw_context = f"User hardware: {state.hardware_profile}\nRecommendations:\n{rec_text}"
-            intro = await self._conversation.stream_response(
-                f"Hello! Please help me choose a model. Here is my hardware:\n{hw_context}",
-            )
+            # Trigger LLM to open the conversation (not shown to user; LLM reply is first output)
+            await self._conversation.stream_response("Hi", system=system_prompt)
         except (APIKeyMissingError, ImportError) as e:
             await self._log(f"[warning]LLM unavailable ({e}) — using simple model selection.[/warning]")
+            recs = ModelRecommender(self._catalog).recommend(self._hardware) if self._hardware else []
+            rec_text = "\n".join(f"  {i+1}. {r.model.display_name}" for i, r in enumerate(recs))
             await self._simple_model_selection(state, sm, rec_text)
             return
-
-        # intro already printed via ChatResponseChunkEvent during stream_response
 
         async def handle_message(text: str) -> None:
             if text.startswith("/"):
                 await self._handle_slash(text, state, sm)
                 return
-            # user text is already shown by prompt_toolkit — don't print again
 
             # Extract path from user message BEFORE LLM call so we can store it
             user_path = self._extract_path_from_message(text)
@@ -183,7 +168,7 @@ class App:
                 state.install_path = user_path
                 self._store.save(state)
 
-            response = await self._conversation.stream_response(text)
+            response = await self._conversation.stream_response(text, system=system_prompt)
 
             # Priority: user's explicit text mention > LLM signal
             # This prevents the LLM from picking the wrong variant (e.g. 4B when user said 1B)
@@ -204,6 +189,50 @@ class App:
             await self._chat_input.run_loop(handle_message)
         except _StopLoop:
             pass
+
+    def _format_hardware_for_llm(self) -> str:
+        hw = self._hardware
+        if not hw:
+            return "Hardware info unavailable."
+        lines = [
+            f"- OS: {hw.os_platform} {hw.os_version}",
+            f"- CPU: {hw.cpu.brand} ({hw.cpu.physical_cores} physical cores, {hw.cpu.architecture})",
+            f"- RAM: {hw.ram_total_gb:.1f} GB total, {hw.ram_available_gb:.1f} GB available",
+        ]
+        for gpu in hw.gpus:
+            lines.append(
+                f"- GPU: {gpu.name}  {gpu.vram_gb:.1f} GB VRAM  [{gpu.compute_backend.value}]"
+                + (f"  CUDA {gpu.cuda_version}" if gpu.cuda_version else "")
+            )
+        for drive in hw.drives[:4]:
+            lines.append(f"- Disk: {drive.path}  {drive.free_gb:.0f}/{drive.total_gb:.0f} GB free")
+        return "\n".join(lines)
+
+    def _format_catalog_for_llm(self) -> str:
+        lines = []
+        for m in self._catalog.all():
+            quants = "  |  ".join(
+                f"{q.quant_type} {q.file_size_gb:.1f}GB (min_vram={q.min_vram_gb:.1f}GB)"
+                for q in m.quantizations
+            )
+            lines.append(
+                f"[{m.model_id}]  {m.display_name}  {m.parameter_count_b:.1f}B params  "
+                f"min_ram={m.min_ram_gb:.0f}GB  capabilities={','.join(m.capabilities)}  "
+                f"modality={','.join(m.modality)}\n"
+                f"  Quantizations: {quants}"
+            )
+        return "\n\n".join(lines)
+
+    def _build_recommendation_system_prompt(self) -> str:
+        from model_manager.agent.base import load_prompt
+        base = load_prompt("system_recommendation.txt")
+        hw_section = self._format_hardware_for_llm()
+        catalog_section = self._format_catalog_for_llm()
+        return (
+            f"{base}\n\n"
+            f"## User's Hardware\n{hw_section}\n\n"
+            f"## Available Models\n{catalog_section}"
+        )
 
     async def _simple_model_selection(
         self, state: InstallationState, sm: StateMachine, rec_text: str
@@ -371,11 +400,21 @@ class App:
                         continue
                     else:
                         await self._log(f"[error]Branch fix failed: {result.error}[/error]")
+                        should_retry = await self._handle_user_intervention(
+                            step, diagnosis, state
+                        )
+                        if should_retry:
+                            continue
                         await sm.trigger("branch_needs_user")
                         return
 
                 except (BranchDepthExceededError, BranchFailedError) as e:
                     await self._log(f"[error]Recovery exhausted: {e}[/error]")
+                    should_retry = await self._handle_user_intervention(
+                        step, diagnosis, state
+                    )
+                    if should_retry:
+                        continue
                     await sm.trigger("branch_fatal")
                     return
 
@@ -537,6 +576,61 @@ class App:
         return None
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    async def _handle_user_intervention(
+        self,
+        step,
+        diagnosis,
+        state: InstallationState,
+    ) -> bool:
+        """
+        Show manual-action instructions when automated recovery fails.
+        Returns True if the failed step should be retried.
+        """
+        import os
+        from model_manager.ui.console import console
+
+        console.print("\n[header]── Manual Action Required ──[/header]")
+        if diagnosis.user_explanation:
+            console.print(f"[warning]{diagnosis.user_explanation}[/warning]")
+
+        root_cause = (diagnosis.root_cause or "").lower()
+        is_auth = (
+            diagnosis.error_category in ("auth_error", "access_denied")
+            or "401" in root_cause
+            or "token" in root_cause
+            or "huggingface" in root_cause
+            or "gated" in root_cause
+        )
+
+        if is_auth:
+            model_id = state.selected_model_id or ""
+            model_url = f"https://huggingface.co/{model_id}" if model_id else "https://huggingface.co"
+            console.print("\n[header]Steps to fix:[/header]")
+            console.print(f"  1. Open [info]{model_url}[/info] in your browser and accept the model license")
+            console.print("  2. Go to [info]https://huggingface.co/settings/tokens[/info] and create a read-scope token")
+            console.print("  3. Paste your token below — it will be used for this session only\n")
+
+            token = (await self._chat_input.get_input("HuggingFace token (or /cancel to abort): ")).strip()
+            if token.lower() == "/cancel" or not token:
+                return False
+
+            os.environ["HF_TOKEN"] = token
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+            await self._log("[success]Token accepted — retrying download...[/success]")
+            return True
+
+        # Generic: list required manual steps then ask to retry
+        if diagnosis.requires_user_decision and diagnosis.decision_options:
+            console.print("\n[header]Steps to fix:[/header]")
+            for i, opt in enumerate(diagnosis.decision_options, 1):
+                console.print(f"  {i}. {opt}")
+
+        console.print()
+        raw = (await self._chat_input.get_input("Press Enter to retry after completing the steps above (or /cancel to abort): ")).strip()
+        if raw.lower() == "/cancel":
+            return False
+        return True
 
     async def _log(self, message: str) -> None:
         await bus.emit(LogLineEvent(level="info", message=message))
