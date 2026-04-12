@@ -566,23 +566,38 @@ class App:
 
         token = self._hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
-        # For GGUF quantized models, download the single file
-        if quant and quant.filename_pattern and entry:
-            repo_id = quant.repo_url.split("huggingface.co/")[-1] if quant.repo_url else model_id
-            # Resolve the actual filename from pattern
-            filename = await self._resolve_gguf_filename(repo_id, quant.filename_pattern, token=token)
+        # For GGUF quantized models, download the single file from quant.repo_url
+        if quant and quant.repo_url and entry:
+            gguf_repo_id = quant.repo_url.split("huggingface.co/")[-1].strip("/")
+
+            if quant.filename_pattern:
+                filename = await self._resolve_gguf_filename(gguf_repo_id, quant.filename_pattern, token=token)
+            else:
+                filename = None
+
             if filename:
                 await self._log(f"  Downloading file: {filename}")
                 local = await asyncio.to_thread(
                     hf_hub_download,
-                    repo_id=repo_id,
+                    repo_id=gguf_repo_id,
                     filename=filename,
                     local_dir=str(dest_dir),
                     token=token,
                 )
                 return Path(local)
+            else:
+                # Pattern match failed — snapshot the whole GGUF repo
+                await self._log(f"  Snapshot download of GGUF repo {gguf_repo_id}...")
+                local = await asyncio.to_thread(
+                    snapshot_download,
+                    repo_id=gguf_repo_id,
+                    local_dir=str(dest_dir),
+                    ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
+                    token=token,
+                )
+                return Path(local)
 
-        # Fallback: snapshot download (all files)
+        # No quant info — snapshot download using model_id directly
         await self._log(f"  Snapshot download of {model_id}...")
         local = await asyncio.to_thread(
             snapshot_download,
