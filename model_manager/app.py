@@ -60,6 +60,7 @@ class App:
         self._conversation: Optional[ConversationManager] = None
         self._perm             = get_permission_manager()
         self._chat_confirmed   = False   # True when user confirmed model+path via chat
+        self._hf_token: Optional[str] = None   # set when user provides HF token
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -563,11 +564,13 @@ class App:
         import os
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # faster downloads if hf_transfer present
 
+        token = self._hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
         # For GGUF quantized models, download the single file
         if quant and quant.filename_pattern and entry:
             repo_id = quant.repo_url.split("huggingface.co/")[-1] if quant.repo_url else model_id
             # Resolve the actual filename from pattern
-            filename = await self._resolve_gguf_filename(repo_id, quant.filename_pattern)
+            filename = await self._resolve_gguf_filename(repo_id, quant.filename_pattern, token=token)
             if filename:
                 await self._log(f"  Downloading file: {filename}")
                 local = await asyncio.to_thread(
@@ -575,6 +578,7 @@ class App:
                     repo_id=repo_id,
                     filename=filename,
                     local_dir=str(dest_dir),
+                    token=token,
                 )
                 return Path(local)
 
@@ -585,15 +589,16 @@ class App:
             repo_id=model_id,
             local_dir=str(dest_dir),
             ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
+            token=token,
         )
         return Path(local)
 
-    async def _resolve_gguf_filename(self, repo_id: str, pattern: str) -> Optional[str]:
+    async def _resolve_gguf_filename(self, repo_id: str, pattern: str, token: Optional[str] = None) -> Optional[str]:
         """Find a file in the HF repo matching the glob pattern."""
         try:
             from huggingface_hub import list_repo_files
             import fnmatch
-            files = await asyncio.to_thread(list_repo_files, repo_id)
+            files = await asyncio.to_thread(list_repo_files, repo_id, token=token)
             for f in files:
                 if fnmatch.fnmatch(f.lower(), pattern.lower().lstrip("*")):
                     return f
@@ -639,13 +644,23 @@ class App:
             console.print("  2. Go to [info]https://huggingface.co/settings/tokens[/info] and create a read-scope token")
             console.print("  3. Paste your token below — it will be used for this session only\n")
 
-            token = (await self._chat_input.get_input("HuggingFace token (or /cancel to abort): ")).strip()
-            if token.lower() == "/cancel" or not token:
+            raw_input = (await self._chat_input.get_input("HuggingFace token (or /cancel to abort): ")).strip()
+            if raw_input.lower() == "/cancel" or not raw_input:
+                return False
+
+            # Extract bare token — user may paste surrounding text like "token: 'hf_xxx'"
+            import re as _re
+            m = _re.search(r"hf_[A-Za-z0-9]+", raw_input)
+            token = m.group(0) if m else raw_input.strip("'\"\t ")
+
+            if not token:
+                await self._log("[warning]No token found in input — please paste just the token.[/warning]")
                 return False
 
             os.environ["HF_TOKEN"] = token
             os.environ["HUGGING_FACE_HUB_TOKEN"] = token
-            await self._log("[success]Token accepted — retrying download...[/success]")
+            self._hf_token = token
+            await self._log(f"[success]Token accepted ({token[:8]}...) — retrying download...[/success]")
             return True
 
         # Generic: list required manual steps then ask to retry
