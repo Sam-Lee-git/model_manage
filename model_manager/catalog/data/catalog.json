@@ -1,0 +1,309 @@
+{
+  "version": "0.1.0",
+  "models": [
+    {
+      "model_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "display_name": "Qwen 2.5 0.5B Instruct",
+      "family": "qwen",
+      "parameter_count_b": 0.5,
+      "modality": ["text"],
+      "capabilities": ["chat"],
+      "license": "apache-2.0",
+      "min_ram_gb": 2.0,
+      "min_vram_gb": 0.0,
+      "min_disk_gb": 1.0,
+      "supported_backends": ["cuda", "rocm", "metal", "cpu"],
+      "context_length": 32768,
+      "languages": ["en", "zh"],
+      "tags": ["small", "fast", "cpu-friendly"],
+      "description": "Tiny but capable model, ideal for CPU-only environments.",
+      "hf_repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "quantizations": [
+        {
+          "quant_type": "Q4_K_M",
+          "file_size_gb": 0.4,
+          "min_vram_gb": 0.0,
+          "quality_score": 0.78,
+          "repo_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+          "filename_pattern": "*q4_k_m*.gguf"
+        },
+        {
+          "quant_type": "Q8_0",
+          "file_size_gb": 0.6,
+          "min_vram_gb": 0.0,
+          "quality_score": 0.92,
+          "repo_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+          "filename_pattern": "*q8_0*.gguf"
+        }
+      ]
+    },
+    {
+      "model_id": "meta-llama/Llama-3.2-3B-Instruct-GGUF",
+      "display_name": "Llama 3.2 3B Instruct",
+      "family": "llama",
+      "parameter_count_b": 3.0,
+      "modality": ["text"],
+      "capabilities": ["chat", "code"],
+      "license": "llama3.2",
+      "min_ram_gb": 4.0,
+      "min_vram_gb": 0.0,
+      "min_disk_gb": 3.0,
+      "supported_backends": ["cuda", "rocm", "metal", "cpu"],
+      "context_length": 131072,
+      "languages": ["en"],
+      "tags": ["efficient", "edge"],
+      "description": "Efficient 3B model with 128K context.",
+      "hf_repo_id": "meta-llama/Llama-3.2-3B-Instruct",
+      "quantizations": [
+        {
+          "quant_type": "Q4_K_M",
+          "file_size_gb": 1.9,
+          "min_vram_gb": 2.5,
+          "quality_score": 0.80,
+          "repo_url": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF",
+          "filename_pattern": "*Q4_K_M*.gguf"
+        },
+        {
+          "quant_type": "Q8_0",
+          "file_size_gb": 3.4,
+          "min_vram_gb": 4.0,
+          "quality_score": 0.94,
+          "repo_url": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF",
+          "filename_pattern": "*Q8_0*.gguf"
+        }
+      ]
+    },
+    {
+      "model_id": "meta-llama/Llama-3.1-8B-Instruct-GGUF",
+      "display_name": "Llama 3.1 8B Instruct",
+      "family": "llama",
+      "parameter_count_b": 8.0,
+      "modality": ["text"],
+      "capabilities": ["chat", "code", "reasoning"],
+      "license": "llama3.1",
+      "min_ram_gb": 8.0,
+      "min_vram_gb": 5.0,
+      "min_disk_gb": 8.0,
+      "supported_backends": ["cuda", "rocm", "metal", "cpu"],
+      "context_length": 131072,
+      "languages": ["en"],
+      "tags": ["popular", "balanced"],
+      "description": "The most widely used open source model. Great balance of capability and size.",
+      "hf_repo_id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+      "quantizations": [
+        {
+          "quant_type": "Q4_K_M",
+          "file_size_gb": 4.9,
+          "min_vram_gb": 5.5,
+          "quality_score": 0.82,
+          "repo_url": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+          "filename_pattern": "*Q4_K_M*.gguf"
+        },
+        {
+          "quant_type": "Q8_0",
+          "file_size_gb": 8.5,
+          "min_vram_gb": 9.0,
+          "quality_score": 0.95,
+          "repo_url": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+          "filename_pattern": "*Q8_0*.gguf"
+        },
+        {
+          "quant_type": "fp16",
+          "file_size_gb": 16.0,
+          "min_vram_gb": 16.0,
+          "quality_score": 1.0,
+          "repo_url": "https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct",
+          "filename_pattern": "*.safetensors"
+        }
+      ]
+    },
+    {
+      "model_id": "google/gemma-4-1b-it",
+      "display_name": "Gemma 4 1B Instruct",
+      "family": "gemma",
+      "parameter_count_b": 1.0,
+      "modality": ["text"],
+      "capabilities": ["chat"],
+      "license": "gemma",
+      "min_ram_gb": 2.0,
+      "min_vram_gb": 0.0,
+      "min_disk_gb": 1.0,
+      "supported_backends": ["cuda", "rocm", "metal", "cpu"],
+      "context_length": 32768,
+      "languages": ["en", "multilingual"],
+      "tags": ["small", "fast", "cpu-friendly", "gemma4"],
+      "description": "Google Gemma 4 1B — ultra-lightweight, runs on CPU.",
+      "hf_repo_id": "google/gemma-4-1b-it",
+      "quantizations": [
+        {
+          "quant_type": "Q4_K_M",
+          "file_size_gb": 0.7,
+          "min_vram_gb": 0.0,
+          "quality_score": 0.78,
+          "repo_url": "https://huggingface.co/bartowski/gemma-4-1b-it-GGUF",
+          "filename_pattern": "*Q4_K_M*.gguf"
+        },
+        {
+          "quant_type": "Q8_0",
+          "file_size_gb": 1.2,
+          "min_vram_gb": 0.0,
+          "quality_score": 0.92,
+          "repo_url": "https://huggingface.co/bartowski/gemma-4-1b-it-GGUF",
+          "filename_pattern": "*Q8_0*.gguf"
+        }
+      ]
+    },
+    {
+      "model_id": "google/gemma-4-4b-it",
+      "display_name": "Gemma 4 4B Instruct",
+      "family": "gemma",
+      "parameter_count_b": 4.0,
+      "modality": ["text", "image"],
+      "capabilities": ["chat", "vision"],
+      "license": "gemma",
+      "min_ram_gb": 6.0,
+      "min_vram_gb": 3.0,
+      "min_disk_gb": 4.0,
+      "supported_backends": ["cuda", "rocm", "metal", "cpu"],
+      "context_length": 131072,
+      "languages": ["en", "multilingual"],
+      "tags": ["multimodal", "vision", "efficient", "gemma4"],
+      "description": "Google Gemma 4 4B — multimodal (text+image), 128K context, great all-rounder.",
+      "hf_repo_id": "google/gemma-4-4b-it",
+      "quantizations": [
+        {
+          "quant_type": "Q4_K_M",
+          "file_size_gb": 2.5,
+          "min_vram_gb": 3.0,
+          "quality_score": 0.82,
+          "repo_url": "https://huggingface.co/bartowski/gemma-4-4b-it-GGUF",
+          "filename_pattern": "*Q4_K_M*.gguf"
+        },
+        {
+          "quant_type": "Q8_0",
+          "file_size_gb": 4.5,
+          "min_vram_gb": 5.0,
+          "quality_score": 0.95,
+          "repo_url": "https://huggingface.co/bartowski/gemma-4-4b-it-GGUF",
+          "filename_pattern": "*Q8_0*.gguf"
+        },
+        {
+          "quant_type": "fp16",
+          "file_size_gb": 8.0,
+          "min_vram_gb": 8.0,
+          "quality_score": 1.0,
+          "repo_url": "https://huggingface.co/google/gemma-4-4b-it",
+          "filename_pattern": "*.safetensors"
+        }
+      ]
+    },
+    {
+      "model_id": "google/gemma-4-12b-it",
+      "display_name": "Gemma 4 12B Instruct",
+      "family": "gemma",
+      "parameter_count_b": 12.0,
+      "modality": ["text", "image"],
+      "capabilities": ["chat", "vision", "reasoning"],
+      "license": "gemma",
+      "min_ram_gb": 12.0,
+      "min_vram_gb": 7.0,
+      "min_disk_gb": 8.0,
+      "supported_backends": ["cuda", "rocm", "metal", "cpu"],
+      "context_length": 131072,
+      "languages": ["en", "multilingual"],
+      "tags": ["multimodal", "vision", "strong-reasoning", "gemma4"],
+      "description": "Google Gemma 4 12B — powerful multimodal model with strong reasoning.",
+      "hf_repo_id": "google/gemma-4-12b-it",
+      "quantizations": [
+        {
+          "quant_type": "Q4_K_M",
+          "file_size_gb": 7.2,
+          "min_vram_gb": 7.5,
+          "quality_score": 0.84,
+          "repo_url": "https://huggingface.co/bartowski/gemma-4-12b-it-GGUF",
+          "filename_pattern": "*Q4_K_M*.gguf"
+        },
+        {
+          "quant_type": "Q8_0",
+          "file_size_gb": 13.0,
+          "min_vram_gb": 14.0,
+          "quality_score": 0.96,
+          "repo_url": "https://huggingface.co/bartowski/gemma-4-12b-it-GGUF",
+          "filename_pattern": "*Q8_0*.gguf"
+        }
+      ]
+    },
+    {
+      "model_id": "google/gemma-4-27b-it",
+      "display_name": "Gemma 4 27B Instruct",
+      "family": "gemma",
+      "parameter_count_b": 27.0,
+      "modality": ["text", "image"],
+      "capabilities": ["chat", "vision", "reasoning", "code"],
+      "license": "gemma",
+      "min_ram_gb": 32.0,
+      "min_vram_gb": 16.0,
+      "min_disk_gb": 20.0,
+      "supported_backends": ["cuda", "rocm", "metal"],
+      "context_length": 131072,
+      "languages": ["en", "multilingual"],
+      "tags": ["large", "multimodal", "vision", "flagship", "gemma4"],
+      "description": "Google Gemma 4 27B — flagship multimodal model, top-tier quality.",
+      "hf_repo_id": "google/gemma-4-27b-it",
+      "quantizations": [
+        {
+          "quant_type": "Q4_K_M",
+          "file_size_gb": 16.0,
+          "min_vram_gb": 17.0,
+          "quality_score": 0.86,
+          "repo_url": "https://huggingface.co/bartowski/gemma-4-27b-it-GGUF",
+          "filename_pattern": "*Q4_K_M*.gguf"
+        },
+        {
+          "quant_type": "Q8_0",
+          "file_size_gb": 29.0,
+          "min_vram_gb": 30.0,
+          "quality_score": 0.97,
+          "repo_url": "https://huggingface.co/bartowski/gemma-4-27b-it-GGUF",
+          "filename_pattern": "*Q8_0*.gguf"
+        }
+      ]
+    },
+    {
+      "model_id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+      "display_name": "Qwen 2.5 7B Instruct",
+      "family": "qwen",
+      "parameter_count_b": 7.0,
+      "modality": ["text"],
+      "capabilities": ["chat", "code", "reasoning"],
+      "license": "apache-2.0",
+      "min_ram_gb": 8.0,
+      "min_vram_gb": 5.0,
+      "min_disk_gb": 7.0,
+      "supported_backends": ["cuda", "rocm", "metal", "cpu"],
+      "context_length": 131072,
+      "languages": ["en", "zh"],
+      "tags": ["multilingual", "code", "strong-reasoning"],
+      "description": "Excellent Chinese + English model with strong coding and reasoning.",
+      "hf_repo_id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+      "quantizations": [
+        {
+          "quant_type": "Q4_K_M",
+          "file_size_gb": 4.7,
+          "min_vram_gb": 5.0,
+          "quality_score": 0.83,
+          "repo_url": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF",
+          "filename_pattern": "*q4_k_m*.gguf"
+        },
+        {
+          "quant_type": "Q8_0",
+          "file_size_gb": 8.1,
+          "min_vram_gb": 8.5,
+          "quality_score": 0.95,
+          "repo_url": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF",
+          "filename_pattern": "*q8_0*.gguf"
+        }
+      ]
+    }
+  ]
+}
