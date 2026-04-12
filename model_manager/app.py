@@ -352,7 +352,10 @@ class App:
         coordinator = ResumeCoordinator(self._store)
         start_idx   = state.current_step_index
 
+        MAX_USER_RETRIES = 3
         i = start_idx
+        user_retry_counts: dict[int, int] = {}   # step_index → number of user-assisted retries
+
         while i < len(steps):
             step = steps[i]
             await bus.emit(StepStartedEvent(
@@ -364,6 +367,7 @@ class App:
                 state.current_step_index = i + 1
                 self._store.save(state)
                 await bus.emit(StepCompletedEvent(step_name=step.description, step_index=i))
+                user_retry_counts.pop(i, None)   # reset counter on success
                 i += 1
             except Exception as exc:
                 await bus.emit(StepFailedEvent(
@@ -396,16 +400,24 @@ class App:
                         sm.set_resume_target(SessionState.INSTALLING_DEPENDENCIES)
                         await sm.trigger("branch_verified")
                         await coordinator.resume(state, result, i)
-                        # Retry the same step
+                        user_retry_counts.pop(i, None)
                         continue
                     else:
                         await self._log(f"[error]Branch fix failed: {result.error}[/error]")
+                        retries = user_retry_counts.get(i, 0)
+                        if retries >= MAX_USER_RETRIES:
+                            await self._log(
+                                f"[error]Step '{step.description}' failed {MAX_USER_RETRIES} times "
+                                f"after user intervention. Aborting — please fix the issue and "
+                                f"restart with: mm --resume {state.session_id[:8]}[/error]"
+                            )
+                            await sm.trigger("branch_needs_user")
+                            return
                         should_retry = await self._handle_user_intervention(
                             step, diagnosis, state
                         )
                         if should_retry:
-                            # Exit ERROR_RECOVERY → INSTALLING_DEPENDENCIES so next
-                            # failure can re-enter error_captured cleanly
+                            user_retry_counts[i] = retries + 1
                             sm.set_resume_target(SessionState.INSTALLING_DEPENDENCIES)
                             await sm.trigger("branch_verified")
                             continue
@@ -414,10 +426,20 @@ class App:
 
                 except (BranchDepthExceededError, BranchFailedError) as e:
                     await self._log(f"[error]Recovery exhausted: {e}[/error]")
+                    retries = user_retry_counts.get(i, 0)
+                    if retries >= MAX_USER_RETRIES:
+                        await self._log(
+                            f"[error]Step '{step.description}' failed {MAX_USER_RETRIES} times "
+                            f"after user intervention. Aborting — please fix the issue and "
+                            f"restart with: mm --resume {state.session_id[:8]}[/error]"
+                        )
+                        await sm.trigger("branch_fatal")
+                        return
                     should_retry = await self._handle_user_intervention(
                         step, diagnosis, state
                     )
                     if should_retry:
+                        user_retry_counts[i] = retries + 1
                         sm.set_resume_target(SessionState.INSTALLING_DEPENDENCIES)
                         await sm.trigger("branch_verified")
                         continue
