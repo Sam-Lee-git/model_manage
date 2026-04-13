@@ -69,6 +69,10 @@ class HardwareProfile:
         return any(g.compute_backend == ComputeBackend.CUDA for g in self.gpus)
 
     @property
+    def has_amd_gpu(self) -> bool:
+        return any(g.compute_backend == ComputeBackend.ROCM for g in self.gpus)
+
+    @property
     def best_drive(self) -> Optional[DriveInfo]:
         """Drive with most free space, excluding network/removable."""
         candidates = [d for d in self.drives if not d.is_network and not d.is_removable]

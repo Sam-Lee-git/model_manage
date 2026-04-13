@@ -35,6 +35,23 @@ from model_manager.ui.chat import ChatInput
 from model_manager.ui.dashboard import Dashboard
 
 
+def _is_connection_error(exc: Exception) -> bool:
+    """Return True for network-level errors (not auth, rate-limit, or parse errors)."""
+    type_name = type(exc).__name__.lower()
+    msg       = str(exc).lower()
+    return (
+        "connect" in type_name
+        or "network" in type_name
+        or "connection" in msg
+        or "timed out" in msg
+        or "timeout" in msg
+        or "ssl" in msg
+        or "name resolution" in msg
+        or "unreachable" in msg
+        or "eof" in msg            # httpx EOFError on abrupt close
+    )
+
+
 class App:
     def __init__(
         self,
@@ -158,16 +175,9 @@ class App:
         # Build system prompt with hardware + catalog injected
         system_prompt = self._build_recommendation_system_prompt()
 
-        # Try to use Claude for conversation; fall back to simple input
-        try:
-            self._conversation = ConversationManager()
-            # Trigger LLM to open the conversation (not shown to user; LLM reply is first output)
-            await self._conversation.stream_response("Hi", system=system_prompt)
-        except (APIKeyMissingError, ImportError) as e:
-            await self._log(f"[warning]LLM unavailable ({e}) — using simple model selection.[/warning]")
-            recs = ModelRecommender(self._catalog).recommend(self._hardware) if self._hardware else []
-            rec_text = "\n".join(f"  {i+1}. {r.model.display_name}" for i, r in enumerate(recs))
-            await self._simple_model_selection(state, sm, rec_text)
+        # Try to start the LLM conversation with full error recovery.
+        if not await self._start_conversation_with_recovery(system_prompt):
+            await self._fallback_to_simple_selection(state, sm)
             return
 
         async def handle_message(text: str) -> None:
@@ -181,7 +191,25 @@ class App:
                 state.install_path = user_path
                 self._store.save(state)
 
-            response = await self._conversation.stream_response(text, system=system_prompt)
+            # Search HuggingFace when user mentions a model that may be recently released,
+            # then inject the live search results so the LLM has up-to-date information.
+            llm_input = text
+            search_query = self._extract_model_search_query(text)
+            if search_query:
+                await self._log(f"[muted]Searching HuggingFace for '{search_query}'...[/muted]")
+                search_results = await self._search_hf_models(search_query)
+                if search_results:
+                    search_ctx = self._format_hf_search_results(search_results)
+                    llm_input = (
+                        f"[HuggingFace Search Results for '{search_query}']\n"
+                        f"{search_ctx}\n\n"
+                        f"[User Message]\n{text}"
+                    )
+                    await self._log(
+                        f"[muted]Injected {len(search_results)} HF search result(s) for '{search_query}'.[/muted]"
+                    )
+
+            response = await self._conversation.stream_response(llm_input, system=system_prompt)
 
             # Parse and validate any [RECOMMEND: ...] tags the LLM emitted
             added = await self._parse_and_validate_recommendations(response)
@@ -254,11 +282,17 @@ class App:
                 except Exception:
                     pass  # network error — keep the recommendation
 
+                def _to_float(val: str, default: float) -> float:
+                    """Parse a numeric string that may carry a unit suffix (e.g. '16GB', '8.0 GB')."""
+                    import re as _re
+                    m = _re.search(r"[\d.]+", val)
+                    return float(m.group()) if m else default
+
                 quant_type  = parts.get("quant", "Q4_K_M")
-                min_vram    = float(parts.get("min_vram", "0.0"))
-                min_ram     = float(parts.get("min_ram", "4.0"))
-                file_size   = float(parts.get("file_size", "0.0"))
-                params      = float(parts.get("params", "0"))
+                min_vram    = _to_float(parts.get("min_vram", "0.0"), 0.0)
+                min_ram     = _to_float(parts.get("min_ram",  "4.0"), 4.0)
+                file_size   = _to_float(parts.get("file_size","0.0"), 0.0)
+                params      = _to_float(parts.get("params",   "0"),   0.0)
                 display     = parts.get("name", repo_id.split("/")[-1])
                 note        = parts.get("note", "")
                 vendor      = repo_id.split("/")[0] if "/" in repo_id else "unknown"
@@ -371,6 +405,232 @@ class App:
                 except Exception:
                     pass
             await self._log("[warning]Invalid selection, try again.[/warning]")
+
+    async def _fallback_to_simple_selection(
+        self, state: InstallationState, sm: StateMachine
+    ) -> None:
+        recs = ModelRecommender(self._catalog).recommend(self._hardware) if self._hardware else []
+        rec_text = "\n".join(f"  {i+1}. {r.model.display_name}" for i, r in enumerate(recs))
+        await self._simple_model_selection(state, sm, rec_text)
+
+    # ── LLM startup with layered recovery ────────────────────────────────────
+
+    async def _try_start_conversation(self, system_prompt: str) -> Optional[Exception]:
+        """One attempt to create ConversationManager and warm it up. Returns None on success."""
+        try:
+            self._conversation = ConversationManager()
+            await self._conversation.stream_response("Hi", system=system_prompt)
+            return None
+        except Exception as e:
+            return e
+
+    async def _start_conversation_with_recovery(self, system_prompt: str) -> bool:
+        """
+        Try to start the LLM conversation, with layered recovery:
+          1. No API key      → prompt user to pick provider + enter key, then retry
+          2. Connection error → offer proxy setup / retry / switch provider
+          3. Other errors    → log and return False (caller falls back to simple selection)
+        Returns True when self._conversation is ready to use.
+        """
+        exc = await self._try_start_conversation(system_prompt)
+        if exc is None:
+            return True
+
+        # ── Layer 1: missing API key ──────────────────────────────────────────
+        if isinstance(exc, APIKeyMissingError):
+            provided = await self._prompt_api_key_setup()
+            if not provided:
+                await self._log("[warning]No API key provided — using simple model selection.[/warning]")
+                return False
+            exc = await self._try_start_conversation(system_prompt)
+            if exc is None:
+                return True
+
+        # ── Layer 2: network / connection error ───────────────────────────────
+        if exc is not None and _is_connection_error(exc):
+            return await self._handle_connection_error(exc, system_prompt)
+
+        # ── Layer 3: anything else (wrong key format, SDK version, etc.) ──────
+        if exc is not None:
+            await self._log(f"[warning]LLM unavailable ({exc}) — using simple model selection.[/warning]")
+            return False
+
+        return True
+
+    async def _handle_connection_error(self, exc: Exception, system_prompt: str) -> bool:
+        """
+        Called when the LLM API is unreachable.
+        Offers retry, proxy configuration, or provider switch.
+        Returns True when self._conversation is ready.
+        """
+        import os
+        from model_manager.ui.console import console
+
+        console.print("\n[header]── Network Connection Failed ──[/header]")
+        console.print(f"  [warning]{exc}[/warning]\n")
+        console.print("  Cannot reach the LLM API. Common causes:")
+        console.print("  • No internet connection")
+        console.print("  • Firewall or VPN blocking the API endpoint")
+        console.print("  • HTTP/HTTPS proxy required in your network\n")
+        console.print("  1. Retry                    (check your connection first)")
+        console.print("  2. Set HTTP proxy            (e.g. http://127.0.0.1:7890)")
+        console.print("  3. Switch LLM provider      (try DeepSeek, OpenAI, etc.)")
+        console.print("  4. Continue without AI      (simple model list)\n")
+
+        raw = (await self._chat_input.get_input("Choice [1-4]: ")).strip()
+
+        if raw == "1":
+            exc2 = await self._try_start_conversation(system_prompt)
+            if exc2 is None:
+                await self._log("[success]Connected.[/success]")
+                return True
+            await self._log(f"[warning]Still unreachable: {exc2}[/warning]")
+            return False
+
+        elif raw == "2":
+            proxy = (await self._chat_input.get_input(
+                "  Proxy URL (e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:1080): "
+            )).strip()
+            if not proxy:
+                return False
+            os.environ["HTTPS_PROXY"] = proxy
+            os.environ["HTTP_PROXY"]  = proxy
+            await self._log(f"[info]Proxy set: {proxy} — retrying...[/info]")
+            exc2 = await self._try_start_conversation(system_prompt)
+            if exc2 is None:
+                await self._log("[success]Connected via proxy.[/success]")
+                return True
+            await self._log(f"[warning]Still unreachable with proxy: {exc2}[/warning]")
+            return False
+
+        elif raw == "3":
+            provided = await self._prompt_api_key_setup()
+            if not provided:
+                return False
+            exc2 = await self._try_start_conversation(system_prompt)
+            if exc2 is None:
+                await self._log("[success]Connected.[/success]")
+                return True
+            if _is_connection_error(exc2):
+                await self._log(f"[warning]Still unreachable: {exc2}[/warning]")
+            else:
+                await self._log(f"[warning]LLM unavailable: {exc2}[/warning]")
+            return False
+
+        # option 4 or invalid input
+        return False
+
+    async def _prompt_api_key_setup(self) -> bool:
+        """
+        Interactively ask the user to pick an LLM provider and enter an API key.
+        Sets the matching environment variable so the next ConversationManager() call picks it up.
+        Returns True when a key was successfully entered, False if the user skipped.
+        """
+        import os
+        from model_manager.agent.factory import PROVIDER_ENV_VARS, LLMProvider
+        from model_manager.ui.console import console
+
+        PROVIDERS = [
+            (LLMProvider.CLAUDE,   "Claude (Anthropic)",   "https://console.anthropic.com/settings/keys"),
+            (LLMProvider.DEEPSEEK, "DeepSeek",             "https://platform.deepseek.com/api_keys"),
+            (LLMProvider.QWEN,     "Qwen (Alibaba)",       "https://dashscope.console.aliyun.com/apiKey"),
+            (LLMProvider.OPENAI,   "OpenAI",               "https://platform.openai.com/api-keys"),
+            (LLMProvider.GEMINI,   "Gemini (Google)",      "https://aistudio.google.com/app/apikey"),
+            (LLMProvider.MINIMAX,  "MiniMax",              "https://api.minimax.chat/"),
+        ]
+
+        console.print("\n[header]── No LLM API Key Detected ──[/header]")
+        console.print("An LLM API key is needed for AI-powered model recommendations.\n")
+        for i, (provider, name, _) in enumerate(PROVIDERS, 1):
+            env_var = PROVIDER_ENV_VARS[provider]
+            console.print(f"  {i}. {name:<24} [muted]({env_var})[/muted]")
+        console.print(f"  {len(PROVIDERS) + 1}. Skip  [muted](use simple list selection instead)[/muted]")
+        console.print()
+
+        raw = (await self._chat_input.get_input(f"Select provider [1-{len(PROVIDERS) + 1}]: ")).strip()
+        try:
+            choice = int(raw)
+        except ValueError:
+            return False
+
+        if choice == len(PROVIDERS) + 1:
+            return False
+        if not (1 <= choice <= len(PROVIDERS)):
+            await self._log("[warning]Invalid choice — skipping.[/warning]")
+            return False
+
+        provider, name, key_url = PROVIDERS[choice - 1]
+        env_var = PROVIDER_ENV_VARS[provider]
+
+        console.print(f"\n  Get your {name} API key at: [info]{key_url}[/info]")
+        key = (await self._chat_input.get_input(f"  Paste {name} API key: ")).strip()
+        if not key:
+            await self._log("[warning]Empty key — skipping.[/warning]")
+            return False
+
+        os.environ[env_var] = key
+        await self._log(f"[success]{name} API key set ({key[:8]}...) — continuing.[/success]")
+        return True
+
+    # ── HuggingFace model search ───────────────────────────────────────────────
+
+    def _extract_model_search_query(self, text: str) -> Optional[str]:
+        """
+        Detect model family + version mentions in user text that may refer to a
+        recently released model (e.g. 'Gemma 4', 'Llama 4', 'Qwen3').
+        Returns a short search query string, or None if nothing specific was found.
+        """
+        import re
+        families = [
+            "gemma", "llama", "qwen", "mistral", "deepseek", "phi",
+            "falcon", "mixtral", "yi", "internlm", "baichuan", "glm",
+            "chatglm", "nemotron", "minitron",
+        ]
+        text_lower = text.lower()
+        for family in families:
+            m = re.search(rf"\b{family}\s*(\d+(?:\.\d+)?)\b", text_lower)
+            if m:
+                version = m.group(1)
+                return f"{family} {version}"
+        return None
+
+    async def _search_hf_models(self, query: str, limit: int = 8) -> list[dict]:
+        """Search HuggingFace for GGUF models matching *query*. Returns raw API dicts."""
+        import httpx
+        import os
+        token = self._hf_token or os.environ.get("HF_TOKEN")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://huggingface.co/api/models",
+                    params={
+                        "search": query,
+                        "filter": "gguf",
+                        "sort": "downloads",
+                        "direction": "-1",
+                        "limit": limit,
+                    },
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return resp.json()
+        except Exception:
+            return []
+
+    def _format_hf_search_results(self, results: list[dict]) -> str:
+        lines = []
+        for r in results:
+            repo_id   = r.get("id") or r.get("modelId", "")
+            downloads = r.get("downloads", 0)
+            likes     = r.get("likes", 0)
+            tags      = [t for t in r.get("tags", []) if not t.startswith("license:")][:5]
+            tag_str   = ", ".join(tags) if tags else ""
+            lines.append(
+                f"- {repo_id}  (downloads={downloads}, likes={likes}"
+                + (f", tags: {tag_str}" if tag_str else "") + ")"
+            )
+        return "\n".join(lines) if lines else "No results found."
 
     async def _analyze_storage(
         self, state: InstallationState, sm: StateMachine
@@ -578,7 +838,18 @@ class App:
             # sanitise model_id into a safe folder name
             safe_name = model_id.replace("/", "__").replace("\\", "__")
             model_dir = install_path / safe_name
-            model_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                model_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                # Handle permission failure directly — do NOT let it reach the LLM
+                # recovery loop, which cannot update state.install_path and will loop forever.
+                new_dir = await self._fix_mkdir_permission(model_dir, state)
+                if new_dir is None:
+                    raise PermissionError(
+                        f"Cannot create {model_dir} — user aborted. "
+                        f"Re-run with a writable path: mm --path ~/models"
+                    )
+                model_dir = new_dir
             step.artifacts["model_dir"] = str(model_dir)
             await self._log(f"[success]Created: {model_dir}[/success]")
 
@@ -605,8 +876,18 @@ class App:
                 state.steps[0].artifacts.get("model_dir", state.install_path or ".")
             )
             model_dir.mkdir(parents=True, exist_ok=True)
+
+            # Ensure the HuggingFace cache dir is writable BEFORE the download starts.
+            # If the default ~/.cache/huggingface was previously created by root (a common
+            # side-effect of earlier sudo operations), the xet downloader will fail with
+            # errno 13. We redirect HF_HOME to a path inside the model dir in that case.
+            await self._ensure_hf_cache_writable(model_dir)
+
             await self._log(f"[info]Downloading {model_id} → {model_dir}[/info]")
-            await self._log("[muted]This may take a while for large models...[/muted]")
+            await self._log(
+                "[muted]Download in progress — the HuggingFace progress bar shows live speed. "
+                "A heartbeat line appears every 30 s so you can confirm the process is alive.[/muted]"
+            )
 
             # Select the best quantization if available in catalog
             try:
@@ -616,8 +897,10 @@ class App:
                 entry = None
                 quant = None
 
-            # Try GGUF single-file download first, then snapshot
-            downloaded = await self._download_from_hub(model_id, model_dir, entry, quant)
+            # Run the download with a 30-second heartbeat so the user can see it's not stuck
+            downloaded = await self._download_with_heartbeat(
+                self._download_from_hub(model_id, model_dir, entry, quant)
+            )
             step.artifacts["downloaded_path"] = str(downloaded)
             await self._log(f"[success]Downloaded to: {downloaded}[/success]")
 
@@ -708,6 +991,177 @@ class App:
             console.print("  [muted]  Ollama                 — desktop app experience, easy model switching[/muted]")
             console.print("  [muted]  Docker                 — server/production, need isolation or API endpoint[/muted]")
             console.print("\n  [muted]Tip: use /exit or /quit to stop the Python chat loop.[/muted]")
+
+    # ── Directory permission recovery ─────────────────────────────────────────
+
+    async def _fix_mkdir_permission(
+        self, target_dir: Path, state: InstallationState
+    ) -> Optional[Path]:
+        """
+        Called when mkdir(target_dir) raises PermissionError.
+        Presents the user with concrete options and returns the actual model_dir
+        to use, or None if the user chooses to abort.
+        Updating state.install_path here ensures subsequent steps use the right path.
+        """
+        import os
+        import platform
+        from model_manager.ui.console import console
+
+        username = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
+        home_alt = Path.home() / "models" / target_dir.name
+
+        console.print(f"\n[header]── Cannot create directory ──[/header]")
+        console.print(f"  [warning]Permission denied:[/warning] {target_dir}")
+        console.print(f"  User '{username}' does not have write access to this path.\n")
+
+        options: list[tuple[str, str]] = []
+        if platform.system() != "Windows":
+            options.append(("sudo",   f"Enter sudo password  (create {target_dir} and chown to {username})"))
+        options.append(("home",   f"Use home directory   → {home_alt}"))
+        options.append(("custom", "Enter a different path"))
+        options.append(("abort",  "Abort installation"))
+
+        for i, (_, label) in enumerate(options, 1):
+            console.print(f"  {i}. {label}")
+        console.print()
+
+        raw = (await self._chat_input.get_input(f"Choice [1-{len(options)}]: ")).strip()
+        try:
+            idx = int(raw) - 1
+        except ValueError:
+            return None
+        if not (0 <= idx < len(options)):
+            return None
+
+        key = options[idx][0]
+
+        if key == "sudo":
+            return await self._mkdir_with_sudo(target_dir, username, state)
+        elif key == "home":
+            return await self._redirect_install_path(home_alt, state)
+        elif key == "custom":
+            raw_path = (await self._chat_input.get_input("  Install path: ")).strip()
+            if not raw_path:
+                return None
+            custom_base = Path(raw_path).expanduser()
+            custom_dir  = custom_base / target_dir.name
+            return await self._redirect_install_path(custom_dir, state, base=custom_base)
+        return None   # abort
+
+    async def _mkdir_with_sudo(
+        self, target_dir: Path, username: str, state: InstallationState
+    ) -> Optional[Path]:
+        """Create target_dir with sudo and chown it to the current user."""
+        # Find the first non-existent ancestor — that's the one sudo must create.
+        blocked = target_dir
+        while blocked.parent != blocked and not blocked.parent.exists():
+            blocked = blocked.parent
+
+        password = (await self._chat_input.get_input("  sudo password: ")).strip()
+        if not password:
+            return None
+        pw_bytes = (password + "\n").encode()
+
+        async def _run_sudo(*args: str) -> tuple[int, str]:
+            proc = await asyncio.create_subprocess_exec(
+                "sudo", "-S", *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(input=pw_bytes), timeout=20)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return -1, "timed out"
+            return proc.returncode, out.decode(errors="replace")
+
+        rc, out = await _run_sudo("mkdir", "-p", str(target_dir))
+        if rc != 0:
+            await self._log(f"[warning]sudo mkdir failed: {out[:300]}[/warning]")
+            await self._log("[info]Falling back to home directory...[/info]")
+            home_alt = Path.home() / "models" / target_dir.name
+            return await self._redirect_install_path(home_alt, state)
+
+        # Transfer ownership so the process can write without elevation going forward
+        rc2, out2 = await _run_sudo("chown", "-R", username, str(blocked))
+        if rc2 != 0:
+            await self._log(
+                f"[warning]sudo chown failed: {out2[:200]} — "
+                f"directory created but may need: sudo chown -R {username} {blocked}[/warning]"
+            )
+
+        await self._log(f"[success]Created via sudo: {target_dir}[/success]")
+        return target_dir
+
+    async def _redirect_install_path(
+        self,
+        new_dir: Path,
+        state: InstallationState,
+        base: Optional[Path] = None,
+    ) -> Optional[Path]:
+        """
+        Create new_dir, update state.install_path, and return new_dir.
+        base, when given, is stored as state.install_path (the parent of new_dir);
+        otherwise new_dir.parent is used.
+        """
+        try:
+            new_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            await self._log(f"[error]Cannot create {new_dir}: {e}[/error]")
+            return None
+        state.install_path = str(base if base is not None else new_dir.parent)
+        self._store.save(state)
+        await self._log(f"[success]Redirected install path to: {new_dir}[/success]")
+        return new_dir
+
+    async def _ensure_hf_cache_writable(self, fallback_parent: Path) -> None:
+        """
+        Verify the HuggingFace cache directory is writable.
+        If it was created by a previous root/sudo operation the current user cannot
+        write there, which causes the xet downloader (huggingface_hub ≥ 1.x) to fail
+        with errno 13. In that case we redirect HF_HOME to a sub-directory of the
+        model install path, which is guaranteed to be writable.
+        """
+        import os
+        hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+        try:
+            hf_home.mkdir(parents=True, exist_ok=True)
+            probe = hf_home / ".mm_write_probe"
+            probe.touch()
+            probe.unlink()
+        except (PermissionError, OSError):
+            alt = fallback_parent / ".hf_cache"
+            alt.mkdir(parents=True, exist_ok=True)
+            os.environ["HF_HOME"]               = str(alt)
+            os.environ["HUGGINGFACE_HUB_CACHE"]  = str(alt / "hub")
+            await self._log(
+                f"[info]HF cache redirected → {alt}  "
+                f"(default path not writable by current user)[/info]"
+            )
+
+    async def _download_with_heartbeat(self, coro) -> Path:
+        """
+        Await *coro* (a download coroutine) while printing a status line every 30 s
+        so the user can confirm the process is alive during long downloads.
+        """
+        async def _heartbeat() -> None:
+            elapsed = 0
+            while True:
+                await asyncio.sleep(30)
+                elapsed += 30
+                m, s = divmod(elapsed, 60)
+                await self._log(f"[muted]  ... download still running ({m}m {s:02d}s elapsed)[/muted]")
+
+        hb = asyncio.create_task(_heartbeat())
+        try:
+            return await coro
+        finally:
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
 
     async def _download_from_hub(
         self,
