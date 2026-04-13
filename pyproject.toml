@@ -5,8 +5,21 @@ build-backend = "hatchling.build"
 [project]
 name = "model-manager"
 version = "0.1.0"
-description = "Cross-platform AI model deployment agent"
+description = "Cross-platform AI model deployment agent — one command to download and run any LLM"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
+keywords = ["llm", "ai", "model", "huggingface", "deployment", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "anthropic>=0.40.0",
     "openai>=1.40.0",

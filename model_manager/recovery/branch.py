@@ -168,17 +168,22 @@ class BranchExecutor:
         cmd: str | list[str],
         timeout: int = 120,
     ) -> str:
+        # Explicitly pass current os.environ so runtime changes (e.g. HF_TOKEN set
+        # by the user mid-session) are visible to the subprocess.
+        current_env = os.environ.copy()
         if isinstance(cmd, str):
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=current_env,
             )
         else:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=current_env,
             )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)

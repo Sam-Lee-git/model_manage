@@ -143,6 +143,18 @@ class App:
             await sm.trigger("model_selected")
             return
 
+        # Verify catalog repos exist on HuggingFace (fast concurrent HEAD checks)
+        import os
+        await self._log("[muted]Verifying catalog model availability...[/muted]")
+        token = self._hf_token or os.environ.get("HF_TOKEN")
+        validation = await self._catalog.validate_repos(token=token, timeout=5.0)
+        removed = [mid for mid, ok in validation.items() if not ok]
+        if removed:
+            await self._log(
+                f"[warning]Removed {len(removed)} unavailable model(s) from catalog: "
+                + ", ".join(removed) + "[/warning]"
+            )
+
         # Build system prompt with hardware + catalog injected
         system_prompt = self._build_recommendation_system_prompt()
 
@@ -171,6 +183,14 @@ class App:
 
             response = await self._conversation.stream_response(text, system=system_prompt)
 
+            # Parse and validate any [RECOMMEND: ...] tags the LLM emitted
+            added = await self._parse_and_validate_recommendations(response)
+            if added:
+                await self._log(
+                    f"[muted]Validated and registered {len(added)} model(s): "
+                    + ", ".join(added) + "[/muted]"
+                )
+
             # Priority: user's explicit text mention > LLM signal
             # This prevents the LLM from picking the wrong variant (e.g. 4B when user said 1B)
             model_entry = self._fuzzy_match_model_from_text(text)
@@ -190,6 +210,87 @@ class App:
             await self._chat_input.run_loop(handle_message)
         except _StopLoop:
             pass
+
+    async def _parse_and_validate_recommendations(self, response: str) -> list[str]:
+        """
+        Parse [RECOMMEND: ...] tags from an LLM response.
+        HEAD-validates each repo on HuggingFace and adds valid ones to the catalog.
+        Returns list of model_ids that were successfully added.
+        """
+        import os
+        import re
+        import httpx
+        from model_manager.catalog.models import ModelEntry, QuantizationOption
+
+        token = self._hf_token or os.environ.get("HF_TOKEN")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        added: list[str] = []
+
+        matches = re.findall(r'\[RECOMMEND:\s*([^\]]+)\]', response)
+        if not matches:
+            return added
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            for raw in matches:
+                parts: dict[str, str] = {}
+                for segment in raw.split("|"):
+                    if "=" in segment:
+                        k, _, v = segment.partition("=")
+                        parts[k.strip()] = v.strip()
+
+                repo_id = parts.get("repo_id", "").strip("/")
+                if not repo_id:
+                    continue
+
+                # Validate the repo exists on HuggingFace
+                api_url = f"https://huggingface.co/api/models/{repo_id}"
+                try:
+                    r = await client.head(api_url, headers=headers)
+                    if r.status_code >= 400:
+                        await self._log(
+                            f"[muted]Skipping {repo_id} — not found on HuggingFace (HTTP {r.status_code})[/muted]"
+                        )
+                        continue
+                except Exception:
+                    pass  # network error — keep the recommendation
+
+                quant_type  = parts.get("quant", "Q4_K_M")
+                min_vram    = float(parts.get("min_vram", "0.0"))
+                min_ram     = float(parts.get("min_ram", "4.0"))
+                file_size   = float(parts.get("file_size", "0.0"))
+                params      = float(parts.get("params", "0"))
+                display     = parts.get("name", repo_id.split("/")[-1])
+                note        = parts.get("note", "")
+                vendor      = repo_id.split("/")[0] if "/" in repo_id else "unknown"
+
+                quant = QuantizationOption(
+                    quant_type=quant_type,
+                    file_size_gb=file_size,
+                    min_vram_gb=min_vram,
+                    quality_score=0.85,
+                    repo_url=f"https://huggingface.co/{repo_id}",
+                    filename_pattern=f"*{quant_type.lower()}*",
+                )
+                entry = ModelEntry(
+                    model_id=repo_id,
+                    display_name=display,
+                    family=vendor.lower(),
+                    parameter_count_b=params,
+                    modality=["text"],
+                    capabilities=["chat"],
+                    license="unknown",
+                    min_ram_gb=min_ram,
+                    min_vram_gb=min_vram,
+                    min_disk_gb=max(file_size * 1.1, 1.0),
+                    supported_backends=["cuda", "cpu"] if min_vram > 0 else ["cpu"],
+                    quantizations=[quant],
+                    hf_repo_id=repo_id,
+                    description=note,
+                )
+                self._catalog.add_entry(entry)
+                added.append(repo_id)
+
+        return added
 
     def _format_hardware_for_llm(self) -> str:
         hw = self._hardware
@@ -228,12 +329,16 @@ class App:
         from model_manager.agent.base import load_prompt
         base = load_prompt("system_recommendation.txt")
         hw_section = self._format_hardware_for_llm()
+        # Catalog is kept as a supplementary reference for verified models;
+        # primary recommendations come from the LLM's own knowledge.
         catalog_section = self._format_catalog_for_llm()
-        return (
-            f"{base}\n\n"
-            f"## User's Hardware\n{hw_section}\n\n"
-            f"## Available Models\n{catalog_section}"
-        )
+        supplement = (
+            f"\n\n## Supplementary Verified Models (catalog fallback)\n"
+            f"The following models are pre-verified and can also be recommended.\n"
+            f"You may recommend models OUTSIDE this list using [RECOMMEND:] tags.\n"
+            f"{catalog_section}"
+        ) if catalog_section.strip() else ""
+        return f"{base}\n\n## User's Hardware\n{hw_section}{supplement}"
 
     async def _simple_model_selection(
         self, state: InstallationState, sm: StateMachine, rec_text: str
@@ -332,12 +437,12 @@ class App:
                 pass
 
         selector = BackendSelector()
-        backend = await selector.select(
+        backend, reason = await selector.select(
             self._hardware, user_preference=pref
         )
         state.backend = backend.name
         self._store.save(state)
-        await self._log(f"Selected backend: [info]{backend.name}[/info]")
+        await self._log(f"Selected backend: [info]{backend.name}[/info]  ({reason})")
         await sm.trigger("backend_selected")
         await sm.trigger("repos_resolved")  # repo resolution is lightweight for now
 
@@ -536,17 +641,73 @@ class App:
                     downloaded = s.artifacts.get("downloaded_path")
             model_id = state.selected_model_id or ""
             from model_manager.ui.console import console
-            console.print("\n[header]── Launch Instructions ──[/header]")
+            console.print("\n[header]── How to Use Your Model ──[/header]")
             if downloaded and str(downloaded).endswith(".gguf"):
-                console.print(f"  [info]llama.cpp:[/info]")
-                console.print(f"    pip install llama-cpp-python")
-                console.print(f"    python -c \"from llama_cpp import Llama; llm=Llama('{downloaded}'); print(llm('Hello')['choices'][0]['text'])\"")
-                console.print(f"  [info]Ollama:[/info]")
-                console.print(f"    ollama run {model_id.split('/')[-1].lower()}")
+                model_path = downloaded
+                short_name = model_id.split("/")[-1].lower().replace(".", "-")
+
+                console.print("\n  [info]Option 1 — llama-cpp-python (Python, recommended)[/info]")
+                console.print("    Install:")
+                console.print("      pip install llama-cpp-python")
+                console.print("    Interactive chat (run this script):")
+                console.print(f'      from llama_cpp import Llama')
+                console.print(f'      llm = Llama(model_path=r"{model_path}", n_ctx=4096, verbose=False)')
+                console.print(f'      while True:')
+                console.print(f'          user = input("You: ")')
+                console.print(f'          if user.lower() in ("/exit", "/quit"): break')
+                console.print(f'          out = llm.create_chat_completion(messages=[{{"role":"user","content":user}}])')
+                console.print(f'          print("AI:", out["choices"][0]["message"]["content"])')
+
+                console.print("\n  [info]Option 2 — Ollama (local server with API)[/info]")
+                console.print("    Step 1 — Create a Modelfile (save as Modelfile, no extension):")
+                console.print(f'      FROM {model_path}')
+                console.print(f'      PARAMETER num_ctx 4096')
+                console.print("    Step 2 — Import and run:")
+                console.print(f"      ollama create {short_name} -f Modelfile")
+                console.print(f"      ollama run {short_name}")
+
+                console.print("\n  [info]Option 3 — llama-cpp-python OpenAI-compatible server[/info]")
+                console.print("    Install:")
+                console.print("      pip install llama-cpp-python[server]")
+                console.print("    Start server:")
+                console.print(f'      python -m llama_cpp.server --model "{model_path}" --n_ctx 4096')
+                console.print("    Then call it like OpenAI API at http://localhost:8000")
+
             else:
-                console.print(f"  [info]Transformers:[/info]")
-                console.print(f"    pip install transformers torch")
-                console.print(f"    python -c \"from transformers import pipeline; p=pipeline('text-generation',model='{downloaded}'); print(p('Hello')[0]['generated_text'])\"")
+                # Non-GGUF (transformers snapshot)
+                console.print("\n  [info]Option 1 — Transformers (Python)[/info]")
+                console.print("    Install:")
+                console.print("      pip install transformers torch accelerate")
+                console.print("    Interactive chat:")
+                console.print(f'      from transformers import pipeline')
+                console.print(f'      pipe = pipeline("text-generation", model=r"{downloaded}", device_map="auto")')
+                console.print(f'      while True:')
+                console.print(f'          user = input("You: ")')
+                console.print(f'          if user.lower() in ("/exit", "/quit"): break')
+                console.print(f'          out = pipe([{{"role":"user","content":user}}], max_new_tokens=512)')
+                console.print(f'          print("AI:", out[0]["generated_text"][-1]["content"])')
+
+                console.print("\n  [info]Option 2 — Ollama (import local model)[/info]")
+                console.print(f"    ollama pull {model_id}")
+                console.print(f"    ollama run {model_id.split('/')[-1].lower()}")
+
+            # Docker option is applicable for GGUF models only (llama.cpp server image)
+            if downloaded and str(downloaded).endswith(".gguf"):
+                console.print("\n  [info]Option 4 — Docker (production / server deployment)[/info]")
+                console.print("    Run the official llama.cpp server container:")
+                console.print(f'      docker pull ghcr.io/ggerganov/llama.cpp:server')
+                console.print(f'      docker run -p 8080:8080 \\')
+                console.print(f'        -v "{downloaded}:/model.gguf:ro" \\')
+                console.print(f'        ghcr.io/ggerganov/llama.cpp:server \\')
+                console.print(f'        -m /model.gguf --host 0.0.0.0 --port 8080 -c 4096')
+                console.print(f'      # OpenAI-compatible API will be available at http://localhost:8080')
+
+            console.print("\n  [muted]When to use each option:[/muted]")
+            console.print("  [muted]  pip / llama-cpp-python — personal use, development, quick start[/muted]")
+            console.print("  [muted]  conda                  — NVIDIA/AMD GPU, need specific CUDA version[/muted]")
+            console.print("  [muted]  Ollama                 — desktop app experience, easy model switching[/muted]")
+            console.print("  [muted]  Docker                 — server/production, need isolation or API endpoint[/muted]")
+            console.print("\n  [muted]Tip: use /exit or /quit to stop the Python chat loop.[/muted]")
 
     async def _download_from_hub(
         self,
@@ -675,7 +836,50 @@ class App:
             os.environ["HF_TOKEN"] = token
             os.environ["HUGGING_FACE_HUB_TOKEN"] = token
             self._hf_token = token
-            await self._log(f"[success]Token accepted ({token[:8]}...) — retrying download...[/success]")
+            await self._log(f"[info]Token set ({token[:8]}...) — verifying access...[/info]")
+
+            # Verify the token actually works before retrying
+            model_id = state.selected_model_id or ""
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi(token=token)
+                user_info = await asyncio.to_thread(api.whoami)
+                username = user_info.get("name", "?")
+                await self._log(f"[success]Token valid (logged in as: {username})[/success]")
+
+                # Check if the specific repo is accessible
+                if model_id:
+                    try:
+                        entry = self._catalog.get_by_id(model_id)
+                        quant = entry.quantizations[0] if entry.quantizations else None
+                        repo_to_check = (
+                            quant.repo_url.split("huggingface.co/")[-1].strip("/")
+                            if quant and quant.repo_url else model_id
+                        )
+                    except Exception:
+                        repo_to_check = model_id
+
+                    try:
+                        await asyncio.to_thread(api.repo_info, repo_to_check)
+                        await self._log(f"[success]Repo access confirmed: {repo_to_check}[/success]")
+                    except Exception as repo_err:
+                        err_str = str(repo_err)
+                        if "403" in err_str or "401" in err_str:
+                            await self._log(
+                                f"[warning]Token valid but repo access denied for {repo_to_check}.[/warning]\n"
+                                f"[warning]You may need to accept the license at: "
+                                f"https://huggingface.co/{repo_to_check}[/warning]"
+                            )
+                        elif "404" in err_str:
+                            await self._log(
+                                f"[warning]Repo not found: {repo_to_check} — the repo ID in the catalog may be wrong.[/warning]"
+                            )
+                        else:
+                            await self._log(f"[warning]Repo check: {repo_err}[/warning]")
+            except Exception as e:
+                await self._log(f"[warning]Token may be invalid — whoami failed: {e}[/warning]")
+
+            await self._log("[info]Retrying download...[/info]")
             return True
 
         # Generic: list required manual steps then ask to retry

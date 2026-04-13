@@ -43,6 +43,55 @@ class ModelCatalog:
             except Exception:
                 continue   # skip malformed entries
 
+    async def validate_repos(
+        self,
+        token: Optional[str] = None,
+        timeout: float = 5.0,
+    ) -> dict[str, bool]:
+        """
+        Concurrently HEAD-check each model's primary GGUF repo_url.
+        Returns {model_id: True/False}.
+        Removes models with unreachable repos (404) from self._models in-place.
+        Network errors (timeout/no connectivity) keep the model to avoid false removals.
+        """
+        import asyncio
+        import httpx
+
+        results: dict[str, bool] = {}
+
+        async def _check_one(client: httpx.AsyncClient, model: ModelEntry) -> tuple[str, bool]:
+            repo_url = next(
+                (q.repo_url for q in model.quantizations if q.repo_url),
+                None,
+            )
+            if not repo_url:
+                return model.model_id, True  # no URL to check — keep
+
+            repo_id = repo_url.split("huggingface.co/")[-1].strip("/")
+            api_url = f"https://huggingface.co/api/models/{repo_id}"
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+            try:
+                r = await client.head(api_url, headers=headers)
+                return model.model_id, r.status_code < 400
+            except Exception:
+                return model.model_id, True  # network error — keep model
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            tasks = [_check_one(client, m) for m in list(self._models.values())]
+            pairs = await asyncio.gather(*tasks)
+
+        to_remove: list[str] = []
+        for model_id, ok in pairs:
+            results[model_id] = ok
+            if not ok:
+                to_remove.append(model_id)
+
+        for mid in to_remove:
+            self._models.pop(mid, None)
+
+        return results
+
     async def update_from_remote(self, url: str) -> bool:
         """Download updated catalog and save to cache. Returns True on success."""
         import httpx
@@ -59,6 +108,10 @@ class ModelCatalog:
             return True
         except Exception:
             return False
+
+    def add_entry(self, entry: "ModelEntry") -> None:
+        """Add or replace a model entry (used for dynamically validated LLM recommendations)."""
+        self._models[entry.model_id] = entry
 
     # ── Query ─────────────────────────────────────────────────────────────────
 
