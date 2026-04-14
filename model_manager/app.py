@@ -922,75 +922,199 @@ class App:
             for s in state.steps:
                 if s.step_type == "download_model":
                     downloaded = s.artifacts.get("downloaded_path")
-            model_id = state.selected_model_id or ""
+            model_id  = state.selected_model_id or ""
+            short_name = model_id.split("/")[-1].lower().replace(".", "-")
             from model_manager.ui.console import console
-            console.print("\n[header]── How to Use Your Model ──[/header]")
-            if downloaded and str(downloaded).endswith(".gguf"):
-                model_path = downloaded
-                short_name = model_id.split("/")[-1].lower().replace(".", "-")
 
-                console.print("\n  [info]Option 1 — llama-cpp-python (Python, recommended)[/info]")
-                console.print("    Install:")
-                console.print("      pip install llama-cpp-python")
-                console.print("    Interactive chat (run this script):")
-                console.print(f'      from llama_cpp import Llama')
-                console.print(f'      llm = Llama(model_path=r"{model_path}", n_ctx=4096, verbose=False)')
-                console.print(f'      while True:')
-                console.print(f'          user = input("You: ")')
-                console.print(f'          if user.lower() in ("/exit", "/quit"): break')
-                console.print(f'          out = llm.create_chat_completion(messages=[{{"role":"user","content":user}}])')
-                console.print(f'          print("AI:", out["choices"][0]["message"]["content"])')
+            # ── Detect model type ────────────────────────────────────────────
+            # snapshot_download returns a directory; files inside may be .gguf.
+            # A single hf_hub_download returns a .gguf file directly.
+            gguf_file: Optional[str] = None   # first (or only) shard to pass to tools
+            gguf_dir:  Optional[str] = None   # directory containing all shards
+            num_shards = 0
+            non_gguf_dir: Optional[str] = None
 
-                console.print("\n  [info]Option 2 — Ollama (local server with API)[/info]")
-                console.print("    Step 1 — Create a Modelfile (save as Modelfile, no extension):")
-                console.print(f'      FROM {model_path}')
-                console.print(f'      PARAMETER num_ctx 4096')
-                console.print("    Step 2 — Import and run:")
-                console.print(f"      ollama create {short_name} -f Modelfile")
-                console.print(f"      ollama run {short_name}")
+            if downloaded:
+                dl = Path(downloaded)
+                if dl.suffix.lower() == ".gguf" and dl.is_file():
+                    gguf_file = str(dl)
+                    gguf_dir  = str(dl.parent)
+                    num_shards = 1
+                elif dl.is_dir():
+                    shards = sorted(dl.glob("*.gguf"))
+                    if shards:
+                        gguf_file  = str(shards[0])
+                        gguf_dir   = str(dl)
+                        num_shards = len(shards)
+                    else:
+                        non_gguf_dir = str(dl)
 
-                console.print("\n  [info]Option 3 — llama-cpp-python OpenAI-compatible server[/info]")
-                console.print("    Install:")
-                console.print("      pip install llama-cpp-python[server]")
-                console.print("    Start server:")
-                console.print(f'      python -m llama_cpp.server --model "{model_path}" --n_ctx 4096')
-                console.print("    Then call it like OpenAI API at http://localhost:8000")
+            has_nvidia = bool(self._hardware and self._hardware.has_nvidia_gpu)
+            has_amd    = bool(self._hardware and self._hardware.has_amd_gpu)
 
+            # ── Header ───────────────────────────────────────────────────────
+            console.print("\n[header]── How to Launch Your Model ──[/header]\n")
+            console.print(f"  Model    : [model]{model_id}[/model]")
+            if gguf_file:
+                console.print(f"  Format   : GGUF  ({'multi-shard, ' + str(num_shards) + ' files' if num_shards > 1 else 'single file'})")
+                console.print(f"  Location : {gguf_dir}")
+                if num_shards > 1:
+                    console.print(f"  First shard: {Path(gguf_file).name}")
+                    console.print(f"  [muted](llama.cpp loads all shards automatically from the first file)[/muted]")
+            elif non_gguf_dir:
+                console.print(f"  Format   : HuggingFace safetensors/bin")
+                console.print(f"  Location : {non_gguf_dir}")
+            console.print()
+
+            # ── GGUF branch ──────────────────────────────────────────────────
+            if gguf_file:
+                gpu_install = ""
+                n_gpu_flag  = ""
+                if has_nvidia:
+                    gpu_install = '  CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir'
+                    n_gpu_flag  = "\n      n_gpu_layers=-1,    # offload all layers to CUDA GPU"
+                elif has_amd:
+                    gpu_install = '  CMAKE_ARGS="-DGGML_HIPBLAS=on" pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir'
+                    n_gpu_flag  = "\n      n_gpu_layers=-1,    # offload all layers to ROCm GPU"
+
+                sep = "  " + "─" * 60
+
+                # Option 1 — interactive chat
+                console.print(f"[info]  Option 1 — Interactive chat  (llama-cpp-python)[/info]")
+                console.print(f"{sep}")
+                console.print(f"  Install (CPU):")
+                console.print(f"    pip install llama-cpp-python")
+                if gpu_install:
+                    console.print(f"\n  Install (GPU — {'CUDA' if has_nvidia else 'ROCm'}, replaces CPU build):")
+                    console.print(f"  {gpu_install.strip()}")
+                console.print(f"\n  Run (save as chat.py and execute with: python chat.py):")
+                console.print(f'    from llama_cpp import Llama')
+                console.print(f'    llm = Llama(')
+                console.print(f'        model_path=r"{gguf_file}",')
+                console.print(f'        n_ctx=4096,{n_gpu_flag}')
+                console.print(f'        verbose=False,')
+                console.print(f'    )')
+                console.print(f'    while True:')
+                console.print(f'        user = input("You: ")')
+                console.print(f'        if user.lower() in ("/exit", "/quit"): break')
+                console.print(f'        out = llm.create_chat_completion(')
+                console.print(f'            messages=[{{"role":"user","content":user}}],')
+                console.print(f'            max_tokens=512,')
+                console.print(f'        )')
+                console.print(f'        print("AI:", out["choices"][0]["message"]["content"])')
+                console.print()
+
+                # Option 2 — OpenAI-compatible HTTP API server
+                console.print(f"[info]  Option 2 — OpenAI-compatible HTTP API server  (llama-cpp-python)[/info]")
+                console.print(f"{sep}")
+                console.print(f"  Install:")
+                console.print(f'    pip install "llama-cpp-python[server]"')
+                if gpu_install:
+                    console.print(f'    {gpu_install.strip()}  # then reinstall [server] extras:')
+                    console.print(f'    pip install "llama-cpp-python[server]" --no-build-isolation')
+                gpu_server_flag = " \\\n      --n_gpu_layers -1" if n_gpu_flag else ""
+                console.print(f"\n  Start server:")
+                console.print(f'    python -m llama_cpp.server \\')
+                console.print(f'      --model "{gguf_file}" \\')
+                console.print(f'      --n_ctx 4096{gpu_server_flag} \\')
+                console.print(f'      --host 0.0.0.0 --port 8000')
+                console.print(f'\n  Call the API — curl:')
+                console.print(f'    curl http://localhost:8000/v1/chat/completions \\')
+                console.print(f'      -H "Content-Type: application/json" \\')
+                console.print(f"      -d '{{")
+                console.print(f'        "model": "local",')
+                console.print(f'        "messages": [{{"role":"user","content":"Hello!"}}],')
+                console.print(f'        "max_tokens": 512')
+                console.print(f"      }}'")
+                console.print(f'\n  Call the API — Python (openai package):')
+                console.print(f'    from openai import OpenAI')
+                console.print(f'    client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")')
+                console.print(f'    resp = client.chat.completions.create(')
+                console.print(f'        model="local",')
+                console.print(f'        messages=[{{"role":"user","content":"Hello!"}}],')
+                console.print(f'    )')
+                console.print(f'    print(resp.choices[0].message.content)')
+                console.print()
+
+                # Option 3 — Ollama
+                console.print(f"[info]  Option 3 — Ollama  (easy local server, chat UI)[/info]")
+                console.print(f"{sep}")
+                console.print(f"  1. Create a Modelfile (no file extension):")
+                console.print(f'       FROM {gguf_dir}')
+                console.print(f'       PARAMETER num_ctx 4096')
+                console.print(f"  2. Import and run:")
+                console.print(f"       ollama create {short_name} -f Modelfile")
+                console.print(f"       ollama run {short_name}")
+                console.print(f"  3. Ollama REST API (runs on port 11434 by default):")
+                console.print(f'       curl http://localhost:11434/api/chat \\')
+                console.print(f"         -d '{{\"model\":\"{short_name}\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello!\"}}]}}'")
+                console.print()
+
+                # Option 4 — Docker
+                docker_image = "ghcr.io/ggerganov/llama.cpp:server-cuda" if has_nvidia else "ghcr.io/ggerganov/llama.cpp:server"
+                docker_gpu   = " --gpus all \\" if has_nvidia else " \\"
+                console.print(f"[info]  Option 4 — Docker  (production / isolated API server)[/info]")
+                console.print(f"{sep}")
+                console.print(f"  docker pull {docker_image}")
+                console.print(f"  docker run{docker_gpu}")
+                console.print(f'    -p 8080:8080 \\')
+                console.print(f'    -v "{gguf_dir}:/models:ro" \\')
+                console.print(f"    {docker_image} \\")
+                console.print(f"    -m /models/{Path(gguf_file).name} \\")
+                console.print(f"    --host 0.0.0.0 --port 8080 --n-gpu-layers -1 -c 4096")
+                console.print(f"  # OpenAI-compatible API at http://localhost:8080/v1")
+                console.print(f"  # Health check: curl http://localhost:8080/health")
+
+            # ── Non-GGUF (HF safetensors) branch ────────────────────────────
             else:
-                # Non-GGUF (transformers snapshot)
-                console.print("\n  [info]Option 1 — Transformers (Python)[/info]")
-                console.print("    Install:")
-                console.print("      pip install transformers torch accelerate")
-                console.print("    Interactive chat:")
-                console.print(f'      from transformers import pipeline')
-                console.print(f'      pipe = pipeline("text-generation", model=r"{downloaded}", device_map="auto")')
-                console.print(f'      while True:')
-                console.print(f'          user = input("You: ")')
-                console.print(f'          if user.lower() in ("/exit", "/quit"): break')
-                console.print(f'          out = pipe([{{"role":"user","content":user}}], max_new_tokens=512)')
-                console.print(f'          print("AI:", out[0]["generated_text"][-1]["content"])')
+                model_path_str = non_gguf_dir or downloaded or model_id
+                sep = "  " + "─" * 60
 
-                console.print("\n  [info]Option 2 — Ollama (import local model)[/info]")
-                console.print(f"    ollama pull {model_id}")
-                console.print(f"    ollama run {model_id.split('/')[-1].lower()}")
+                # Option 1 — Transformers chat
+                console.print(f"[info]  Option 1 — Interactive chat  (Transformers)[/info]")
+                console.print(f"{sep}")
+                console.print(f"  Install:")
+                console.print(f"    pip install transformers torch accelerate")
+                console.print(f"\n  Run:")
+                console.print(f'    from transformers import pipeline')
+                console.print(f'    pipe = pipeline("text-generation", model=r"{model_path_str}", device_map="auto")')
+                console.print(f'    while True:')
+                console.print(f'        user = input("You: ")')
+                console.print(f'        if user.lower() in ("/exit", "/quit"): break')
+                console.print(f'        out = pipe([{{"role":"user","content":user}}], max_new_tokens=512)')
+                console.print(f'        print("AI:", out[0]["generated_text"][-1]["content"])')
+                console.print()
 
-            # Docker option is applicable for GGUF models only (llama.cpp server image)
-            if downloaded and str(downloaded).endswith(".gguf"):
-                console.print("\n  [info]Option 4 — Docker (production / server deployment)[/info]")
-                console.print("    Run the official llama.cpp server container:")
-                console.print(f'      docker pull ghcr.io/ggerganov/llama.cpp:server')
-                console.print(f'      docker run -p 8080:8080 \\')
-                console.print(f'        -v "{downloaded}:/model.gguf:ro" \\')
-                console.print(f'        ghcr.io/ggerganov/llama.cpp:server \\')
-                console.print(f'        -m /model.gguf --host 0.0.0.0 --port 8080 -c 4096')
-                console.print(f'      # OpenAI-compatible API will be available at http://localhost:8080')
+                # Option 2 — vLLM OpenAI server
+                console.print(f"[info]  Option 2 — OpenAI-compatible HTTP API server  (vLLM)[/info]")
+                console.print(f"{sep}")
+                console.print(f"  Install:")
+                console.print(f"    pip install vllm")
+                console.print(f"\n  Start server:")
+                console.print(f'    python -m vllm.entrypoints.openai.api_server \\')
+                console.print(f'      --model "{model_path_str}" \\')
+                console.print(f'      --host 0.0.0.0 --port 8000')
+                console.print(f'\n  Call the API — curl:')
+                console.print(f'    curl http://localhost:8000/v1/chat/completions \\')
+                console.print(f'      -H "Content-Type: application/json" \\')
+                console.print(f"      -d '{{\"model\":\"{model_path_str}\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello!\"}}],\"max_tokens\":512}}'")
+                console.print(f'\n  Call the API — Python (openai package):')
+                console.print(f'    from openai import OpenAI')
+                console.print(f'    client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")')
+                console.print(f'    resp = client.chat.completions.create(model="{model_id}", messages=[{{"role":"user","content":"Hello!"}}])')
+                console.print(f'    print(resp.choices[0].message.content)')
+                console.print()
 
-            console.print("\n  [muted]When to use each option:[/muted]")
-            console.print("  [muted]  pip / llama-cpp-python — personal use, development, quick start[/muted]")
-            console.print("  [muted]  conda                  — NVIDIA/AMD GPU, need specific CUDA version[/muted]")
-            console.print("  [muted]  Ollama                 — desktop app experience, easy model switching[/muted]")
-            console.print("  [muted]  Docker                 — server/production, need isolation or API endpoint[/muted]")
-            console.print("\n  [muted]Tip: use /exit or /quit to stop the Python chat loop.[/muted]")
+                # Option 3 — Ollama (create from local dir)
+                console.print(f"[info]  Option 3 — Ollama  (import local model)[/info]")
+                console.print(f"{sep}")
+                console.print(f"  1. Create a Modelfile:")
+                console.print(f'       FROM {model_path_str}')
+                console.print(f'       PARAMETER num_ctx 4096')
+                console.print(f"  2. Import and run:")
+                console.print(f"       ollama create {short_name} -f Modelfile")
+                console.print(f"       ollama run {short_name}")
+                console.print()
 
     # ── Directory permission recovery ─────────────────────────────────────────
 
