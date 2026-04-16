@@ -817,6 +817,178 @@ class App:
         await self._log(f"[info]Using default: {options[0][1]}[/info]")
         return options[0][0]
 
+    # ── llama-cpp-python compilation error recovery ───────────────────────────
+
+    def _get_cuda_version(self) -> Optional[str]:
+        """Return CUDA version as 'cu124', 'cu123', etc., or None."""
+        if not (self._hardware and self._hardware.gpus):
+            return None
+        cv = self._hardware.gpus[0].cuda_version  # e.g. "12.4" or "12.4.1"
+        if not cv:
+            return None
+        parts = cv.split(".")
+        try:
+            major, minor = int(parts[0]), int(parts[1])
+            return f"cu{major}{minor}"
+        except (IndexError, ValueError):
+            return None
+
+    @staticmethod
+    def _classify_build_error(output: str) -> str:
+        """Return a human-readable description of a llama-cpp build failure."""
+        lo = output.lower()
+        if "nvcc" in lo and ("not found" in lo or "no such file" in lo or "command not found" in lo):
+            return "nvcc not found — CUDA toolkit is not in PATH"
+        if "cmake" in lo and ("not found" in lo or "command not found" in lo or "no such" in lo):
+            return "CMake not installed or not in PATH"
+        if "cuda version" in lo or "unsupported gpu architecture" in lo or "compute_" in lo:
+            return "CUDA version mismatch or unsupported GPU architecture"
+        if "hipblas" in lo or "rocm" in lo:
+            return "ROCm/HIP build error"
+        if "error:" in lo or "fatal error" in lo:
+            return "C++ compilation error"
+        return "build error"
+
+    async def _try_pip_install(
+        self,
+        packages: list[str],
+        extra_env: Optional[dict] = None,
+    ) -> tuple[bool, str]:
+        """Run pip install; return (success, combined_output)."""
+        import os as _os
+        env = _os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "--quiet", *packages,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+        )
+        chunks: list[str] = []
+        async for line in proc.stdout:
+            txt = line.decode(errors="replace").rstrip()
+            if txt:
+                chunks.append(txt)
+                await self._log(f"  {txt}")
+        await proc.wait()
+        return proc.returncode == 0, "\n".join(chunks)
+
+    async def _install_llama_cpp(self, has_nvidia: bool, has_amd: bool) -> None:
+        """
+        Install llama-cpp-python with automatic fallback on build errors:
+          1. GPU source build (CUDA or ROCm)
+          2. Pre-built wheel for detected CUDA version
+          3. Pre-built wheels for neighbouring CUDA versions (cu124→cu123→cu122→cu121)
+          4. CPU-only wheel
+        Also installs the [server] extras afterwards.
+        """
+        from model_manager.ui.console import console
+
+        if has_nvidia:
+            # ── Attempt 1: source build with CUDA ─────────────────────────
+            await self._log(
+                "  [muted]Building with CUDA support (CMAKE_ARGS=-DGGML_CUDA=on) — may take a few minutes[/muted]"
+            )
+            ok, out = await self._try_pip_install(
+                ["llama-cpp-python", "--force-reinstall", "--no-cache-dir"],
+                extra_env={"CMAKE_ARGS": "-DGGML_CUDA=on"},
+            )
+            if ok:
+                await self._log("[success]llama-cpp-python (CUDA build) installed.[/success]")
+            else:
+                reason = self._classify_build_error(out)
+                await self._log(f"  [warning]CUDA source build failed: {reason}[/warning]")
+                await self._log("  [info]Trying pre-built GPU wheels...[/info]")
+
+                # ── Attempt 2 & 3: pre-built wheels ───────────────────────
+                cuda_ver = self._get_cuda_version()
+                tried_vers: list[str] = []
+                if cuda_ver:
+                    tried_vers.append(cuda_ver)
+                # Always include a fallback set; skip ones already tried
+                for fallback in ("cu124", "cu123", "cu122", "cu121"):
+                    if fallback not in tried_vers:
+                        tried_vers.append(fallback)
+
+                wheel_ok = False
+                for cv in tried_vers:
+                    index_url = f"https://abetlen.github.io/llama-cpp-python/whl/{cv}"
+                    await self._log(f"  [muted]Trying pre-built wheel for {cv} from {index_url}[/muted]")
+                    ok2, out2 = await self._try_pip_install(
+                        ["llama-cpp-python", "--force-reinstall", "--no-cache-dir",
+                         "--extra-index-url", index_url],
+                    )
+                    if ok2:
+                        await self._log(f"[success]llama-cpp-python ({cv} pre-built wheel) installed.[/success]")
+                        wheel_ok = True
+                        break
+                    else:
+                        await self._log(f"  [muted]{cv} wheel not available — trying next[/muted]")
+
+                if not wheel_ok:
+                    # ── Attempt 4: CPU-only fallback ───────────────────────
+                    await self._log(
+                        "  [warning]No pre-built GPU wheel found. "
+                        "Falling back to CPU-only build (no GPU acceleration).[/warning]"
+                    )
+                    ok3, out3 = await self._try_pip_install(["llama-cpp-python", "--force-reinstall"])
+                    if not ok3:
+                        raise RuntimeError(
+                            f"llama-cpp-python CPU fallback also failed:\n{out3[-2000:]}"
+                        )
+                    await self._log("[success]llama-cpp-python (CPU-only) installed.[/success]")
+                    console.print(
+                        "\n  [warning]Note: installed CPU-only build — GPU layers disabled.[/warning]"
+                    )
+                    console.print(
+                        "  To enable GPU later, fix nvcc/CMake and re-run:\n"
+                        "    CMAKE_ARGS='-DGGML_CUDA=on' pip install llama-cpp-python "
+                        "--force-reinstall --no-cache-dir\n"
+                    )
+
+        elif has_amd:
+            # ── Attempt 1: ROCm/HIP source build ──────────────────────────
+            await self._log(
+                "  [muted]Building with ROCm/HIP support (CMAKE_ARGS=-DGGML_HIPBLAS=on)[/muted]"
+            )
+            ok, out = await self._try_pip_install(
+                ["llama-cpp-python", "--force-reinstall", "--no-cache-dir"],
+                extra_env={"CMAKE_ARGS": "-DGGML_HIPBLAS=on"},
+            )
+            if ok:
+                await self._log("[success]llama-cpp-python (ROCm build) installed.[/success]")
+            else:
+                reason = self._classify_build_error(out)
+                await self._log(f"  [warning]ROCm build failed: {reason}[/warning]")
+                await self._log("  [info]Falling back to CPU-only build...[/info]")
+                ok2, out2 = await self._try_pip_install(["llama-cpp-python", "--force-reinstall"])
+                if not ok2:
+                    raise RuntimeError(f"llama-cpp-python CPU fallback failed:\n{out2[-2000:]}")
+                await self._log("[success]llama-cpp-python (CPU-only) installed.[/success]")
+                console.print(
+                    "\n  [warning]Note: installed CPU-only build — GPU layers disabled.[/warning]"
+                )
+
+        else:
+            # ── CPU-only ───────────────────────────────────────────────────
+            await self._log("  [muted]No GPU detected — installing CPU-only build[/muted]")
+            ok, out = await self._try_pip_install(["llama-cpp-python"])
+            if not ok:
+                raise RuntimeError(f"llama-cpp-python install failed:\n{out[-2000:]}")
+            await self._log("[success]llama-cpp-python (CPU) installed.[/success]")
+
+        # ── Server extras (always) ─────────────────────────────────────────
+        await self._log("  [muted]Installing llama-cpp-python[server] extras...[/muted]")
+        ok_s, out_s = await self._try_pip_install(
+            ["llama-cpp-python[server]", "--no-build-isolation"]
+        )
+        if not ok_s:
+            await self._log(
+                "  [warning]Server extras install failed (non-fatal): "
+                f"{out_s[-500:]}[/warning]"
+            )
+
     async def _install_with_recovery(
         self, state: InstallationState, sm: StateMachine
     ) -> None:
@@ -996,22 +1168,7 @@ class App:
             # ── Serving-method specific packages ──────────────────────────
             if method == "llama_cpp":
                 await self._log("[info]Installing llama-cpp-python...[/info]")
-                if has_nvidia:
-                    await self._log("  [muted]Building with CUDA support (CMAKE_ARGS=-DGGML_CUDA=on) — this takes a few minutes[/muted]")
-                    await _pip(
-                        "llama-cpp-python", "--force-reinstall", "--no-cache-dir",
-                        extra_env={"CMAKE_ARGS": "-DGGML_CUDA=on"},
-                    )
-                elif has_amd:
-                    await self._log("  [muted]Building with ROCm/HIP support (CMAKE_ARGS=-DGGML_HIPBLAS=on)[/muted]")
-                    await _pip(
-                        "llama-cpp-python", "--force-reinstall", "--no-cache-dir",
-                        extra_env={"CMAKE_ARGS": "-DGGML_HIPBLAS=on"},
-                    )
-                else:
-                    await _pip("llama-cpp-python")
-                # Also install the OpenAI-compatible server extras
-                await _pip("llama-cpp-python[server]", "--no-build-isolation")
+                await self._install_llama_cpp(has_nvidia, has_amd)
 
             elif method == "transformers":
                 await self._log("[info]Installing transformers, torch, accelerate...[/info]")
