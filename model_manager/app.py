@@ -100,6 +100,9 @@ class App:
         self._hf_token: Optional[str] = (
             os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         )
+        # Ordered list of model IDs shown in the last pick-list; used by
+        # _try_parse_model_selection so "1" maps to what the user actually saw.
+        self._last_recommended_ids: list[str] = []
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -885,6 +888,89 @@ class App:
             return "C++ compilation error"
         return "build error"
 
+    async def _install_ollama(self) -> bool:
+        """Install Ollama automatically. Returns True on success."""
+        import shutil
+        import sys as _sys
+        import platform as _platform
+
+        plat = _platform.system()
+        await self._log("[info]Installing Ollama...[/info]")
+
+        try:
+            if plat == "Windows":
+                # Prefer winget (available on Windows 10 1709+ / Windows 11)
+                if shutil.which("winget"):
+                    await self._log("[muted]  Using winget to install Ollama...[/muted]")
+                    proc = await asyncio.create_subprocess_exec(
+                        "winget", "install", "Ollama.Ollama",
+                        "--accept-source-agreements", "--accept-package-agreements",
+                        "--silent",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                    )
+                    out, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+                    if proc.returncode == 0:
+                        await self._log("[success]Ollama installed via winget.[/success]")
+                        return True
+                    await self._log(f"[warning]winget failed (exit {proc.returncode}), trying direct download...[/warning]")
+
+                # Fallback: download the official installer and run it silently
+                import tempfile, httpx
+                await self._log("[muted]  Downloading OllamaSetup.exe...[/muted]")
+                installer_url = "https://ollama.com/download/OllamaSetup.exe"
+                with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+                    tmp_path = f.name
+                async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
+                    async with client.stream("GET", installer_url) as resp:
+                        resp.raise_for_status()
+                        with open(tmp_path, "wb") as fh:
+                            async for chunk in resp.aiter_bytes(65536):
+                                fh.write(chunk)
+                await self._log("[muted]  Running installer (this may take a moment)...[/muted]")
+                proc = await asyncio.create_subprocess_exec(
+                    tmp_path, "/SILENT", "/NORESTART",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=300)
+                # Refresh PATH in current process
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as k:
+                    path_val, _ = winreg.QueryValueEx(k, "Path")
+                os.environ["PATH"] = path_val + ";" + os.environ.get("PATH", "")
+
+            else:
+                # Linux / macOS
+                await self._log("[muted]  Running: curl -fsSL https://ollama.com/install.sh | sh[/muted]")
+                proc = await asyncio.create_subprocess_shell(
+                    "curl -fsSL https://ollama.com/install.sh | sh",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+                if proc.returncode != 0:
+                    raise RuntimeError(out.decode(errors="replace")[-1000:])
+
+            if shutil.which("ollama"):
+                await self._log("[success]Ollama installed successfully.[/success]")
+                return True
+
+            # Give PATH a moment to settle then check again
+            await asyncio.sleep(2)
+            # Re-check with updated PATH
+            if shutil.which("ollama"):
+                await self._log("[success]Ollama installed successfully.[/success]")
+                return True
+
+            await self._log("[warning]Ollama installed but not yet in PATH. You may need to restart your terminal after this session.[/warning]")
+            return True   # installer ran — mark success even if PATH not refreshed yet
+
+        except Exception as exc:
+            await self._log(f"[error]Ollama auto-install failed: {exc}[/error]")
+            return False
+
     async def _try_pip_install(
         self,
         packages: list[str],
@@ -1226,16 +1312,18 @@ class App:
                 await _pip("vllm")
 
             elif method == "ollama":
-                from model_manager.ui.console import console
                 import shutil
+                import sys as _sys
                 if shutil.which("ollama"):
                     await self._log("[success]Ollama already installed.[/success]")
                 else:
-                    console.print("\n  [warning]Ollama is not a Python package — install it separately:[/warning]")
-                    console.print("  [info]  Linux/macOS:[/info]  curl -fsSL https://ollama.com/install.sh | sh")
-                    console.print("  [info]  Windows:[/info]      https://ollama.com/download/windows")
-                    console.print("  After installing, re-run:  mm --resume " + state.session_id[:8])
-                    console.print()
+                    await self._log("[info]Ollama not found — installing automatically...[/info]")
+                    installed = await self._install_ollama()
+                    if not installed:
+                        raise RuntimeError(
+                            "Ollama installation failed. Please install manually from "
+                            "https://ollama.com and re-run: mm --resume " + state.session_id[:8]
+                        )
 
             elif method == "docker":
                 from model_manager.ui.console import console
@@ -1996,6 +2084,7 @@ class App:
     def _print_model_list(self, model_ids: list[str]) -> None:
         """Print a numbered list of recommended models so the user can pick one."""
         from model_manager.ui.console import console
+        self._last_recommended_ids = list(model_ids)   # save for number-selection
         console.print("\n[header]── Recommended models ──[/header]")
         for idx, mid in enumerate(model_ids, 1):
             try:
@@ -2143,9 +2232,18 @@ class App:
         """Return ModelEntry if user typed a number or exact model_id."""
         text = text.strip()
         if text.isdigit():
+            idx = int(text) - 1
+            # Use the exact ordered list that was shown to the user, not the
+            # score-sorted recommender output (which may differ and include
+            # unrelated models already in the catalog).
+            if self._last_recommended_ids and 0 <= idx < len(self._last_recommended_ids):
+                try:
+                    return self._catalog.get_by_id(self._last_recommended_ids[idx])
+                except Exception:
+                    pass
+            # Fallback to recommender if no pick-list was shown yet
             if self._hardware:
                 recs = ModelRecommender(self._catalog).recommend(self._hardware)
-                idx = int(text) - 1
                 if 0 <= idx < len(recs):
                     return recs[idx].model
         try:
