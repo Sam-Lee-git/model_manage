@@ -831,21 +831,27 @@ class App:
             console.print()
 
         default_num = 1
-        raw = (await self._chat_input.get_input(
-            f"Enter number [1-{len(options)}] (default {default_num} — {options[0][1]}): "
-        )).strip()
+        prompt = f"Enter number [1-{len(options)}] (default {default_num} — {options[0][1]}): "
+        while True:
+            raw = (await self._chat_input.get_input(prompt)).strip()
 
-        try:
-            idx = int(raw) - 1
-            if 0 <= idx < len(options):
-                chosen = options[idx][0]
-                await self._log(f"[success]Installation method: {options[idx][1]}[/success]")
-                return chosen
-        except ValueError:
-            pass
+            # Empty → accept default
+            if not raw:
+                await self._log(f"[info]Using default: {options[0][1]}[/info]")
+                return options[0][0]
 
-        await self._log(f"[info]Using default: {options[0][1]}[/info]")
-        return options[0][0]
+            if raw.lower() == "/cancel":
+                raise KeyboardInterrupt
+
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(options):
+                    await self._log(f"[success]Installation method: {options[idx][1]}[/success]")
+                    return options[idx][0]
+            except ValueError:
+                pass
+
+            console.print(f"[warning]Please enter a number between 1 and {len(options)}, or press Enter for the default.[/warning]")
 
     # ── llama-cpp-python compilation error recovery ───────────────────────────
 
@@ -1589,13 +1595,15 @@ class App:
             console.print(f"  {i}. {label}")
         console.print()
 
-        raw = (await self._chat_input.get_input(f"Choice [1-{len(options)}]: ")).strip()
-        try:
-            idx = int(raw) - 1
-        except ValueError:
-            return None
-        if not (0 <= idx < len(options)):
-            return None
+        while True:
+            raw = (await self._chat_input.get_input(f"Choice [1-{len(options)}]: ")).strip()
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(options):
+                    break
+            except ValueError:
+                pass
+            console.print(f"[warning]Please enter a number between 1 and {len(options)}.[/warning]")
 
         key = options[idx][0]
 
