@@ -270,13 +270,15 @@ class App:
                 if not repo_id:
                     continue
 
-                # Validate the repo exists on HuggingFace
+                # Validate the repo exists on HuggingFace.
+                # 401/403 means the API needs auth but the repo likely exists — proceed.
+                # Only 404 is a definitive "does not exist".
                 api_url = f"https://huggingface.co/api/models/{repo_id}"
                 try:
                     r = await client.head(api_url, headers=headers)
-                    if r.status_code >= 400:
+                    if r.status_code == 404:
                         await self._log(
-                            f"[muted]Skipping {repo_id} — not found on HuggingFace (HTTP {r.status_code})[/muted]"
+                            f"[muted]Skipping {repo_id} — not found on HuggingFace[/muted]"
                         )
                         continue
                 except Exception:
@@ -1994,11 +1996,12 @@ class App:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 r = await client.head(api_url, headers=headers)
-                if r.status_code >= 400:
+                if r.status_code == 404:
                     await self._log(
-                        f"[muted]Cannot install {repo_id} — not found on HuggingFace (HTTP {r.status_code})[/muted]"
+                        f"[muted]Cannot install {repo_id} — not found on HuggingFace[/muted]"
                     )
                     return None
+                # 401/403 means auth required but repo likely exists — proceed
         except Exception:
             pass  # network error — proceed anyway
 

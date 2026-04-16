@@ -73,7 +73,8 @@ class ModelCatalog:
 
             try:
                 r = await client.head(api_url, headers=headers)
-                return model.model_id, r.status_code < 400
+                # Only treat 404 as definitive absence; 401/403 means auth-gated but likely exists
+                return model.model_id, r.status_code != 404
             except Exception:
                 return model.model_id, True  # network error — keep model
 
