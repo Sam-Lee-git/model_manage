@@ -688,23 +688,134 @@ class App:
     async def _select_backend(
         self, state: InstallationState, sm: StateMachine
     ) -> None:
+        # When --backend is forced via CLI, skip the interactive menu
         from model_manager.core.constants import InstallBackendType
-        pref = None
         if self._force_backend:
+            pref = None
             try:
                 pref = InstallBackendType(self._force_backend)
             except ValueError:
                 pass
+            if pref:
+                from model_manager.backends.selector import BackendSelector
+                selector = BackendSelector()
+                backend, reason = await selector.select(self._hardware, user_preference=pref)
+                state.backend = backend.name
+                self._store.save(state)
+                await self._log(f"Selected backend: [info]{backend.name}[/info]  ({reason})")
+                await sm.trigger("backend_selected")
+                await sm.trigger("repos_resolved")
+                return
 
-        selector = BackendSelector()
-        backend, reason = await selector.select(
-            self._hardware, user_preference=pref
-        )
-        state.backend = backend.name
+        # Interactive serving-method selection
+        method = await self._select_serving_method(state)
+        state.serving_method = method
+        state.backend = "pip_venv"   # all methods use pip for package installs
         self._store.save(state)
-        await self._log(f"Selected backend: [info]{backend.name}[/info]  ({reason})")
         await sm.trigger("backend_selected")
-        await sm.trigger("repos_resolved")  # repo resolution is lightweight for now
+        await sm.trigger("repos_resolved")
+
+    # ── Serving method selection ───────────────────────────────────────────────
+
+    def _is_gguf_model(self, model_id: str) -> bool:
+        """Heuristic: model is GGUF if its repo id or catalog description says so."""
+        if "gguf" in model_id.lower():
+            return True
+        try:
+            entry = self._catalog.get_by_id(model_id)
+            return any(
+                q.repo_url and "gguf" in q.repo_url.lower()
+                for q in entry.quantizations
+            )
+        except Exception:
+            return False
+
+    async def _select_serving_method(self, state: InstallationState) -> str:
+        """
+        Present an interactive menu so the user can choose how to install and run
+        the model. Recommends the best option based on model type and hardware.
+        Returns one of: llama_cpp | ollama | docker | transformers | vllm
+        """
+        from model_manager.ui.console import console
+
+        model_id  = state.selected_model_id or ""
+        is_gguf   = self._is_gguf_model(model_id)
+        has_nvidia = bool(self._hardware and self._hardware.has_nvidia_gpu)
+        has_amd    = bool(self._hardware and self._hardware.has_amd_gpu)
+
+        # ── Hardware summary line ──────────────────────────────────────────
+        hw_parts: list[str] = []
+        if self._hardware:
+            if self._hardware.gpus:
+                names = sorted({g.name for g in self._hardware.gpus})
+                hw_parts.append(
+                    f"{len(self._hardware.gpus)}× {names[0]}  "
+                    f"({self._hardware.total_vram_gb:.0f} GB VRAM)"
+                )
+            hw_parts.append(f"{self._hardware.ram_total_gb:.0f} GB RAM")
+        hw_str = ",  ".join(hw_parts) if hw_parts else "unknown"
+
+        # ── Recommendation logic ───────────────────────────────────────────
+        if is_gguf:
+            if has_nvidia:
+                rec, rec_reason = "llama_cpp", "GGUF + NVIDIA GPU — CUDA-accelerated, full control"
+            elif has_amd:
+                rec, rec_reason = "llama_cpp", "GGUF + AMD GPU — ROCm-accelerated via llama-cpp-python"
+            else:
+                rec, rec_reason = "ollama",    "GGUF + CPU — Ollama is easiest, includes a built-in API server"
+        else:
+            if has_nvidia:
+                rec, rec_reason = "vllm",         "Safetensors + NVIDIA GPU — vLLM gives the fastest OpenAI-compatible API"
+            else:
+                rec, rec_reason = "transformers", "Safetensors + CPU — HuggingFace Transformers is the standard choice"
+
+        # ── Options table ──────────────────────────────────────────────────
+        # (key, display name, best-for description, GPU, includes API server, native fit)
+        ALL_OPTIONS = [
+            ("llama_cpp",    "llama-cpp-python",   "GGUF · scripting & API · full control",    "CUDA / ROCm / CPU", True,  is_gguf),
+            ("ollama",       "Ollama",              "GGUF · easiest setup · desktop & server",  "CUDA / CPU",        True,  is_gguf),
+            ("docker",       "Docker + llama.cpp",  "GGUF · isolated production server",        "CUDA",              True,  is_gguf),
+            ("transformers", "Transformers (HF)",   "Safetensors · scripting · quick start",    "any",               False, not is_gguf),
+            ("vllm",         "vLLM",                "Safetensors · fast API server · prod",     "CUDA only",         True,  not is_gguf and has_nvidia),
+        ]
+        # Sort: recommended first, then native-fit options, then the rest
+        def _rank(opt):
+            k = opt[0]
+            if k == rec:         return 0
+            if opt[5]:           return 1   # native fit
+            return 2
+        options = sorted(ALL_OPTIONS, key=_rank)
+
+        # ── Print menu ─────────────────────────────────────────────────────
+        console.print("\n[header]── Choose Installation Method ──[/header]\n")
+        console.print(f"  Model   : [model]{model_id}[/model]  ({'GGUF' if is_gguf else 'HF safetensors'})")
+        console.print(f"  Hardware: {hw_str}")
+        console.print(f"\n  Recommendation: [info]{rec}[/info]  —  {rec_reason}\n")
+
+        for i, (key, label, best_for, gpu_support, has_api, native) in enumerate(options, 1):
+            star      = " ★" if key == rec else "  "
+            api_tag   = "[success]✓ API server[/success]" if has_api else "[muted]no built-in API[/muted]"
+            fit_tag   = "" if native else "  [muted](not optimal for this model format)[/muted]"
+            console.print(f"  {i}.{star}[info]{label:<24}[/info] {best_for}{fit_tag}")
+            console.print(f"       GPU: {gpu_support:<20}  {api_tag}")
+            console.print()
+
+        default_num = 1
+        raw = (await self._chat_input.get_input(
+            f"Enter number [1-{len(options)}] (default {default_num} — {options[0][1]}): "
+        )).strip()
+
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                chosen = options[idx][0]
+                await self._log(f"[success]Installation method: {options[idx][1]}[/success]")
+                return chosen
+        except ValueError:
+            pass
+
+        await self._log(f"[info]Using default: {options[0][1]}[/info]")
+        return options[0][0]
 
     async def _install_with_recovery(
         self, state: InstallationState, sm: StateMachine
@@ -854,21 +965,85 @@ class App:
             await self._log(f"[success]Created: {model_dir}[/success]")
 
         elif step.step_type == "install_packages":
+            import os as _os
+            method     = state.serving_method or "llama_cpp"
+            has_nvidia = bool(self._hardware and self._hardware.has_nvidia_gpu)
+            has_amd    = bool(self._hardware and self._hardware.has_amd_gpu)
+
+            async def _pip(*packages: str, extra_env: Optional[dict] = None) -> None:
+                env = _os.environ.copy()
+                if extra_env:
+                    env.update(extra_env)
+                proc2 = await asyncio.create_subprocess_exec(
+                    sys.executable, "-m", "pip", "install", "--quiet", *packages,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=env,
+                )
+                async for line in proc2.stdout:
+                    txt = line.decode(errors="replace").rstrip()
+                    if txt:
+                        await self._log(f"  {txt}")
+                await proc2.wait()
+                if proc2.returncode != 0:
+                    raise RuntimeError(f"pip install {' '.join(packages)} failed")
+
+            # ── Always needed: HuggingFace downloader ─────────────────────
             await self._log("[info]Installing huggingface_hub...[/info]")
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "pip", "install", "--quiet",
-                "huggingface_hub", "hf_transfer",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            async for line in proc.stdout:
-                text = line.decode(errors="replace").rstrip()
-                if text:
-                    await self._log(f"  {text}")
-            await proc.wait()
-            if proc.returncode != 0:
-                raise RuntimeError("pip install huggingface_hub failed")
+            await _pip("huggingface_hub", "hf_transfer")
             step.artifacts["hub_installed"] = "1"
+
+            # ── Serving-method specific packages ──────────────────────────
+            if method == "llama_cpp":
+                await self._log("[info]Installing llama-cpp-python...[/info]")
+                if has_nvidia:
+                    await self._log("  [muted]Building with CUDA support (CMAKE_ARGS=-DGGML_CUDA=on) — this takes a few minutes[/muted]")
+                    await _pip(
+                        "llama-cpp-python", "--force-reinstall", "--no-cache-dir",
+                        extra_env={"CMAKE_ARGS": "-DGGML_CUDA=on"},
+                    )
+                elif has_amd:
+                    await self._log("  [muted]Building with ROCm/HIP support (CMAKE_ARGS=-DGGML_HIPBLAS=on)[/muted]")
+                    await _pip(
+                        "llama-cpp-python", "--force-reinstall", "--no-cache-dir",
+                        extra_env={"CMAKE_ARGS": "-DGGML_HIPBLAS=on"},
+                    )
+                else:
+                    await _pip("llama-cpp-python")
+                # Also install the OpenAI-compatible server extras
+                await _pip("llama-cpp-python[server]", "--no-build-isolation")
+
+            elif method == "transformers":
+                await self._log("[info]Installing transformers, torch, accelerate...[/info]")
+                await _pip("transformers", "torch", "accelerate")
+
+            elif method == "vllm":
+                await self._log("[info]Installing vllm (requires NVIDIA CUDA)...[/info]")
+                await _pip("vllm")
+
+            elif method == "ollama":
+                from model_manager.ui.console import console
+                import shutil
+                if shutil.which("ollama"):
+                    await self._log("[success]Ollama already installed.[/success]")
+                else:
+                    console.print("\n  [warning]Ollama is not a Python package — install it separately:[/warning]")
+                    console.print("  [info]  Linux/macOS:[/info]  curl -fsSL https://ollama.com/install.sh | sh")
+                    console.print("  [info]  Windows:[/info]      https://ollama.com/download/windows")
+                    console.print("  After installing, re-run:  mm --resume " + state.session_id[:8])
+                    console.print()
+
+            elif method == "docker":
+                from model_manager.ui.console import console
+                import shutil
+                if shutil.which("docker"):
+                    await self._log("[success]Docker already installed.[/success]")
+                else:
+                    console.print("\n  [warning]Docker is not installed. Install it from:[/warning]")
+                    console.print("  [info]  https://docs.docker.com/get-docker/[/info]")
+                    console.print()
+
+            step.artifacts["serving_method"] = method
 
         elif step.step_type == "download_model":
             model_id = state.selected_model_id or ""

@@ -60,6 +60,7 @@ class InstallationState:
     selected_quant: Optional[str] = None
     install_path: Optional[str] = None
     backend: Optional[str] = None
+    serving_method: Optional[str] = None        # llama_cpp | ollama | docker | transformers | vllm
 
     # Progress
     current_state: str = SessionState.IDLE.value
