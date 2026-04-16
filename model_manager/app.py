@@ -223,7 +223,7 @@ class App:
             # This prevents the LLM from picking the wrong variant (e.g. 4B when user said 1B)
             model_entry = self._fuzzy_match_model_from_text(text)
             if model_entry is None:
-                model_entry = self._try_parse_install_signal(response)
+                model_entry = await self._try_parse_install_signal(response)
             if model_entry is None:
                 model_entry = self._try_parse_model_selection(text)
 
@@ -591,7 +591,7 @@ class App:
             m = re.search(rf"\b{family}\s*(\d+(?:\.\d+)?)\b", text_lower)
             if m:
                 version = m.group(1)
-                return f"{family} {version}"
+                return f"{family}-{version}"
         return None
 
     async def _search_hf_models(self, query: str, limit: int = 8) -> list[dict]:
@@ -1964,7 +1964,7 @@ class App:
                 best = entry
         return best
 
-    def _try_parse_install_signal(self, llm_response: str):
+    async def _try_parse_install_signal(self, llm_response: str):
         """Parse [INSTALL: model_id] emitted by LLM when user confirms a model."""
         import re
         m = re.search(r'\[INSTALL:\s*([^\]]+)\]', llm_response)
@@ -1979,7 +1979,57 @@ class App:
             for entry in self._catalog.all():
                 if needle in entry.model_id.lower() or needle in entry.display_name.lower():
                     return entry
-            return None
+            # Model not yet in catalog — register it on the fly so install can proceed
+            return await self._register_unknown_model(model_id)
+
+    async def _register_unknown_model(self, repo_id: str):
+        """Validate a HF repo and add a minimal catalog entry so installation can start."""
+        import httpx
+        import os
+        from model_manager.catalog.models import ModelEntry, QuantizationOption
+
+        token = self._hf_token or os.environ.get("HF_TOKEN")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        api_url = f"https://huggingface.co/api/models/{repo_id}"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.head(api_url, headers=headers)
+                if r.status_code >= 400:
+                    await self._log(
+                        f"[muted]Cannot install {repo_id} — not found on HuggingFace (HTTP {r.status_code})[/muted]"
+                    )
+                    return None
+        except Exception:
+            pass  # network error — proceed anyway
+
+        display = repo_id.split("/")[-1]
+        vendor  = repo_id.split("/")[0] if "/" in repo_id else "unknown"
+        quant = QuantizationOption(
+            quant_type="Q4_K_M",
+            file_size_gb=4.0,
+            min_vram_gb=0.0,
+            quality_score=0.85,
+            repo_url=f"https://huggingface.co/{repo_id}",
+            filename_pattern="*q4_k_m*",
+        )
+        entry = ModelEntry(
+            model_id=repo_id,
+            display_name=display,
+            family=vendor.lower(),
+            parameter_count_b=0.0,
+            modality=["text"],
+            capabilities=["chat"],
+            license="unknown",
+            min_ram_gb=8.0,
+            min_vram_gb=0.0,
+            min_disk_gb=5.0,
+            supported_backends=["cuda", "cpu"],
+            quantizations=[quant],
+            hf_repo_id=repo_id,
+        )
+        self._catalog.add_entry(entry)
+        await self._log(f"[muted]Registered {repo_id} from install signal.[/muted]")
+        return entry
 
     def _try_parse_model_selection(self, text: str):
         """Return ModelEntry if user typed a number or exact model_id."""
