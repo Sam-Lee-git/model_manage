@@ -101,24 +101,27 @@ class Dashboard:
         console.print(e.message)
 
     async def _on_chat_chunk(self, e: ChatResponseChunkEvent) -> None:
-        """Stream LLM output inline, flush on newlines. Hide internal [INSTALL:...] tokens."""
+        """Stream LLM output inline, flush on newlines. Hide internal control tokens."""
         import re
-        _INSTALL_RE = re.compile(r'\[INSTALL:[^\]]*\]')
+        _TAG_RE = re.compile(r'\[(INSTALL|RECOMMEND):[^\]]*\]')
 
         if e.is_final:
             if self._stream_buffer:
-                clean = _INSTALL_RE.sub("", self._stream_buffer).rstrip()
+                clean = _TAG_RE.sub("", self._stream_buffer).rstrip()
                 if clean:
                     console.print(clean)
                 self._stream_buffer = ""
             return
         self._stream_buffer += e.chunk
-        # Flush complete lines immediately, skip lines that are just the install token
         while "\n" in self._stream_buffer:
             line, self._stream_buffer = self._stream_buffer.split("\n", 1)
-            display = _INSTALL_RE.sub("", line).rstrip()
-            if display:
-                console.print(display)
+            display = _TAG_RE.sub("", line).rstrip()
+            # Preserve blank lines from the LLM (paragraph breaks).
+            # Only skip lines that were non-empty originally but became empty
+            # solely because they contained a filtered control token.
+            if not display and line.strip():
+                continue
+            console.print(display)
 
     async def _on_diagnosis(self, e: DiagnosisReadyEvent) -> None:
         console.print(f"[bold yellow]Diagnosis:[/bold yellow] {e.root_cause}  [muted](confidence {e.confidence:.0%})[/muted]")
