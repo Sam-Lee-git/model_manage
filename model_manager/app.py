@@ -772,11 +772,13 @@ class App:
         # ── Options table ──────────────────────────────────────────────────
         # (key, display name, best-for description, GPU, includes API server, native fit)
         ALL_OPTIONS = [
-            ("llama_cpp",    "llama-cpp-python",   "GGUF · scripting & API · full control",    "CUDA / ROCm / CPU", True,  is_gguf),
-            ("ollama",       "Ollama",              "GGUF · easiest setup · desktop & server",  "CUDA / CPU",        True,  is_gguf),
-            ("docker",       "Docker + llama.cpp",  "GGUF · isolated production server",        "CUDA",              True,  is_gguf),
-            ("transformers", "Transformers (HF)",   "Safetensors · scripting · quick start",    "any",               False, not is_gguf),
-            ("vllm",         "vLLM",                "Safetensors · fast API server · prod",     "CUDA only",         True,  not is_gguf and has_nvidia),
+            ("llama_cpp",     "llama-cpp-python",    "GGUF · Python scripting & API · full control",  "CUDA / ROCm / CPU", True,  is_gguf),
+            ("ollama",        "Ollama",               "GGUF · easiest setup · desktop & server",       "CUDA / CPU",        True,  is_gguf),
+            ("docker",        "Docker + llama.cpp",   "GGUF · isolated production server",             "CUDA",              True,  is_gguf),
+            ("llama_server",  "llama-server (binary)", "GGUF · native HTTP server · fastest startup",  "CUDA / ROCm / CPU", True,  is_gguf),
+            ("llama_cli",     "llama-cli (binary)",    "GGUF · native interactive CLI · no Python",    "CUDA / ROCm / CPU", False, is_gguf),
+            ("transformers",  "Transformers (HF)",    "Safetensors · scripting · quick start",         "any",               False, not is_gguf),
+            ("vllm",          "vLLM",                 "Safetensors · fast API server · prod",          "CUDA only",         True,  not is_gguf and has_nvidia),
         ]
         # Sort: recommended first, then native-fit options, then the rest
         def _rank(opt):
@@ -1200,6 +1202,22 @@ class App:
                     console.print("  [info]  https://docs.docker.com/get-docker/[/info]")
                     console.print()
 
+            elif method in ("llama_server", "llama_cli"):
+                from model_manager.ui.console import console
+                import shutil
+                binary = "llama-server" if method == "llama_server" else "llama-cli"
+                if shutil.which(binary):
+                    await self._log(f"[success]{binary} already installed.[/success]")
+                else:
+                    await self._log(
+                        f"[info]{binary} is a native llama.cpp binary — install instructions below.[/info]"
+                    )
+                    console.print(f"\n  Install {binary}:")
+                    console.print(f"  [info]  macOS  :[/info]  brew install llama.cpp")
+                    console.print(f"  [info]  Linux  :[/info]  sudo apt install llama-cpp   # Ubuntu 24.04+")
+                    console.print(f"  [info]  Windows:[/info]  https://github.com/ggerganov/llama.cpp/releases")
+                    console.print()
+
             step.artifacts["serving_method"] = method
 
         elif step.step_type == "download_model":
@@ -1310,6 +1328,20 @@ class App:
                     n_gpu_flag  = "\n      n_gpu_layers=-1,    # offload all layers to ROCm GPU"
 
                 sep = "  " + "─" * 60
+                chosen_method = state.serving_method or "llama_cpp"
+
+                # Print a one-line "you chose" banner
+                _method_labels = {
+                    "llama_cpp":    "llama-cpp-python  (Options 1 & 2 below)",
+                    "ollama":       "Ollama            (Option 3 below)",
+                    "docker":       "Docker            (Option 4 below)",
+                    "llama_server": "llama-server      (Option 5 below)",
+                    "llama_cli":    "llama-cli         (Option 6 below)",
+                }
+                console.print(
+                    f"  [success]Selected serving method → "
+                    f"{_method_labels.get(chosen_method, chosen_method)}[/success]\n"
+                )
 
                 # Option 1 — interactive chat
                 console.print(f"[info]  Option 1 — Interactive chat  (llama-cpp-python)[/info]")
@@ -1396,6 +1428,43 @@ class App:
                 console.print(f"    --host 0.0.0.0 --port 8080 --n-gpu-layers -1 -c 4096")
                 console.print(f"  # OpenAI-compatible API at http://localhost:8080/v1")
                 console.print(f"  # Health check: curl http://localhost:8080/health")
+                console.print()
+
+                # Option 5 — llama-server (native llama.cpp HTTP server binary)
+                ngl_flag = " --n-gpu-layers -1" if (has_nvidia or has_amd) else ""
+                console.print(f"[info]  Option 5 — llama-server  (native llama.cpp HTTP server binary)[/info]")
+                console.print(f"{sep}")
+                console.print(f"  Install llama.cpp binaries:")
+                console.print(f"    macOS  : brew install llama.cpp")
+                console.print(f"    Linux  : sudo apt install llama-cpp          # Ubuntu 24.04+")
+                console.print(f"    Windows: download from https://github.com/ggerganov/llama.cpp/releases")
+                console.print(f"\n  Start server:")
+                console.print(f'    llama-server \\')
+                console.print(f'      -m "{gguf_file}" \\')
+                console.print(f"      --host 0.0.0.0 --port 8080{ngl_flag} -c 4096")
+                console.print(f"  # OpenAI-compatible API at http://localhost:8080/v1")
+                console.print(f'\n  Quick test:')
+                console.print(f'    curl http://localhost:8080/v1/chat/completions \\')
+                console.print(f'      -H "Content-Type: application/json" \\')
+                console.print(f"      -d '{{\"model\":\"local\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello!\"}}]}}'")
+                console.print()
+
+                # Option 6 — llama-cli (native llama.cpp interactive CLI)
+                console.print(f"[info]  Option 6 — llama-cli  (native llama.cpp interactive CLI)[/info]")
+                console.print(f"{sep}")
+                console.print(f"  Install llama.cpp binaries: (same as Option 5 above)")
+                console.print(f"\n  Interactive conversation mode:")
+                console.print(f'    llama-cli \\')
+                console.print(f'      -m "{gguf_file}" \\')
+                console.print(f"      -cnv{ngl_flag} -c 4096")
+                console.print(f"  # -cnv enables conversation mode (multi-turn chat)")
+                console.print(f"\n  Single prompt (non-interactive):")
+                console.print(f'    llama-cli \\')
+                console.print(f'      -m "{gguf_file}" \\')
+                console.print(f'      -p "Your prompt here" \\')
+                console.print(f"      -n 512{ngl_flag}")
+                console.print(f"\n  Benchmark / perplexity test:")
+                console.print(f'    llama-bench -m "{gguf_file}"{ngl_flag}')
 
             # ── Non-GGUF (HF safetensors) branch ────────────────────────────
             else:
