@@ -94,7 +94,11 @@ class App:
         self._conversation: Optional[ConversationManager] = None
         self._perm             = get_permission_manager()
         self._chat_confirmed   = False   # True when user confirmed model+path via chat
-        self._hf_token: Optional[str] = None   # set when user provides HF token
+        # Seed from environment so token-gated downloads work without the user
+        # re-entering a token they already have exported.
+        self._hf_token: Optional[str] = (
+            os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        )
 
     # ── Entry point ───────────────────────────────────────────────────────────
 

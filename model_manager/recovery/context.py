@@ -25,6 +25,7 @@ class EnvironmentSnapshot:
     platform: str
     available_disk_gb: float
     available_ram_gb: float
+    hf_token_present: bool = False  # True if HF_TOKEN / HUGGING_FACE_HUB_TOKEN is set
 
 
 @dataclass
@@ -98,6 +99,9 @@ def build_error_context(
     except Exception:
         pass
 
+    hf_token_present = bool(
+        os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    )
     env = EnvironmentSnapshot(
         python_version=sys.version,
         pip_packages=_get_pip_packages(),
@@ -108,6 +112,7 @@ def build_error_context(
         platform=sys.platform,
         available_disk_gb=disk_free,
         available_ram_gb=mem.available / 1e9,
+        hf_token_present=hf_token_present,
     )
 
     return ErrorContext(

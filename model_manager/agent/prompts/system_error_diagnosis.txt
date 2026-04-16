@@ -53,24 +53,36 @@ For CUDA issues: check driver version, suggest correct torch wheel URL.
 For network issues: suggest mirrors, proxy settings, or offline alternatives.
 For dependency conflicts: suggest version pins or virtual environment recreation.
 
-## auth_error — HuggingFace authentication (401 / "Repository Not Found" / gated model)
+## auth_error — HuggingFace authentication (401 / 404 on gated model)
 
-- error_category must be "auth_error"
-- requires_user_decision must be true
-- decision_options must list browser steps:
-    ["Accept the model license at https://huggingface.co/<model_id>",
-     "Create a read-scope token at https://huggingface.co/settings/tokens"]
+IMPORTANT: Check environment.hf_token_present in the error context before asking for a token.
+
+### Case A — hf_token_present is FALSE (no token in environment)
+- error_category: "auth_error"
+- requires_user_decision: true
+- decision_options: browser steps to accept the model license and create a token
 - user_inputs_needed must contain exactly one entry:
     {
       "env_var": "HF_TOKEN",
       "prompt": "Paste your HuggingFace read token (get one at https://huggingface.co/settings/tokens): ",
       "sensitive": true
     }
-- fix_plan must have one step using modify_env_var with value "{{HF_TOKEN}}" as a placeholder
-  (the system replaces the placeholder with the collected token before executing):
+- fix_plan: one modify_env_var step with value "{{HF_TOKEN}}" (substituted before execution):
     {"action_type": "modify_env_var", "action_params": {"key": "HF_TOKEN", "value": "{{HF_TOKEN}}"}}
+- alternative_plans: []
 - Do NOT generate shell commands that write the token to disk.
-- alternative_plans should be [] for auth errors.
+
+### Case B — hf_token_present is TRUE (token already set, but download still failed)
+This means the token is valid but the specific GGUF repo may have separate gating.
+- error_category: "auth_error"
+- requires_user_decision: true
+- user_inputs_needed: [] (token is already set — do NOT ask for it again)
+- decision_options must list ONLY the repo-specific acceptance step, e.g.:
+    ["Visit https://huggingface.co/<gguf_repo_id> and accept the repository license if prompted",
+     "Your HF_TOKEN is already set — no new token is needed"]
+- fix_plan: [] (no automated fix; user must accept the gating in a browser)
+- user_explanation: clearly state that the token is present but the specific repository
+  requires a separate license acceptance on HuggingFace.co
 
 ## permission errors (sudo / write permission)
 
