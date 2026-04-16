@@ -971,6 +971,143 @@ class App:
             await self._log(f"[error]Ollama auto-install failed: {exc}[/error]")
             return False
 
+    async def _install_llama_binary(self, binary: str) -> bool:
+        """
+        Install llama.cpp system binaries (llama-server, llama-cli).
+        Tries the platform's native package manager, then a GitHub release download.
+        Returns True when the binary is available in PATH.
+        """
+        import platform
+        import shutil
+        plat = platform.system()
+
+        try:
+            # ── macOS: Homebrew ───────────────────────────────────────────
+            if plat == "Darwin" and shutil.which("brew"):
+                await self._log("[muted]  Installing llama.cpp via brew...[/muted]")
+                proc = await asyncio.create_subprocess_shell(
+                    "brew install llama.cpp",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=600)
+                if shutil.which(binary):
+                    await self._log(f"[success]{binary} installed via brew.[/success]")
+                    return True
+
+            # ── Linux: apt (Ubuntu / Debian) ──────────────────────────────
+            if plat == "Linux" and shutil.which("apt-get"):
+                await self._log("[muted]  Installing llama-cpp via apt-get...[/muted]")
+                proc = await asyncio.create_subprocess_shell(
+                    "sudo apt-get install -y llama-cpp 2>&1",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=300)
+                if shutil.which(binary):
+                    await self._log(f"[success]{binary} installed via apt.[/success]")
+                    return True
+
+            # ── All platforms: GitHub release download ────────────────────
+            await self._log("[muted]  Downloading llama.cpp release from GitHub...[/muted]")
+            installed = await self._install_llama_binary_from_github(binary, plat)
+            if installed:
+                await self._log(f"[success]{binary} installed from GitHub release.[/success]")
+                return True
+
+        except Exception as exc:
+            await self._log(f"[warning]llama.cpp auto-install failed: {exc}[/warning]")
+
+        return False
+
+    async def _install_llama_binary_from_github(self, binary: str, plat: str) -> bool:
+        """Download the latest llama.cpp release from GitHub and add it to PATH."""
+        import zipfile
+        import tarfile
+        import tempfile
+        import httpx
+        import shutil
+
+        api_url = "https://api.github.com/repos/ggerganov/llama.cpp/releases/latest"
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(api_url, headers={"Accept": "application/vnd.github+json"})
+            resp.raise_for_status()
+            release = resp.json()
+
+        assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
+
+        # Pick the right asset for the platform
+        asset_url = None
+        if plat == "Windows":
+            # Prefer AVX2 build; fall back to AVX
+            for suffix in ("avx2-x64.zip", "avx-x64.zip", "noavx-x64.zip", "x64.zip"):
+                for name, url in assets.items():
+                    if "win" in name.lower() and name.endswith(suffix):
+                        asset_url = url
+                        break
+                if asset_url:
+                    break
+        elif plat == "Darwin":
+            for name, url in assets.items():
+                if "macos" in name.lower() and name.endswith(".zip"):
+                    asset_url = url
+                    break
+        elif plat == "Linux":
+            for name, url in assets.items():
+                if "linux" in name.lower() and ("x86_64" in name or "amd64" in name):
+                    asset_url = url
+                    break
+
+        if not asset_url:
+            await self._log("[warning]No matching llama.cpp asset found for this platform.[/warning]")
+            return False
+
+        await self._log(f"[muted]  Downloading {asset_url.split('/')[-1]}...[/muted]")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive_path = Path(tmp_dir) / asset_url.split("/")[-1]
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                async with client.stream("GET", asset_url) as resp:
+                    resp.raise_for_status()
+                    with open(archive_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(65536):
+                            f.write(chunk)
+
+            # Extract
+            extract_dir = Path(tmp_dir) / "extracted"
+            extract_dir.mkdir()
+            if str(archive_path).endswith(".zip"):
+                with zipfile.ZipFile(archive_path) as zf:
+                    zf.extractall(extract_dir)
+            else:
+                with tarfile.open(archive_path) as tf:
+                    tf.extractall(extract_dir)
+
+            # Find the binary and copy to a persistent location
+            bin_ext = ".exe" if plat == "Windows" else ""
+            found = list(extract_dir.rglob(f"{binary}{bin_ext}"))
+            if not found:
+                return False
+
+            # Install to ~/.local/bin (Linux/macOS) or %LOCALAPPDATA%\llama_cpp (Windows)
+            if plat == "Windows":
+                install_dir = Path(os.environ.get("LOCALAPPDATA", tmp_dir)) / "llama_cpp" / "bin"
+            else:
+                install_dir = Path.home() / ".local" / "bin"
+            install_dir.mkdir(parents=True, exist_ok=True)
+
+            dest = install_dir / found[0].name
+            shutil.copy2(found[0], dest)
+            if plat != "Windows":
+                dest.chmod(0o755)
+
+            # Add install_dir to PATH for this session
+            path_str = str(install_dir)
+            if path_str not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = path_str + os.pathsep + os.environ.get("PATH", "")
+
+        return shutil.which(binary) is not None
+
     async def _try_pip_install(
         self,
         packages: list[str],
@@ -1243,10 +1380,96 @@ class App:
             InstallStep("launch_info",   "show_launch_info",   "Show how to launch the model"),
         ]
 
+    async def _preflight_check(self, step: InstallStep, state: InstallationState) -> None:
+        """
+        Detect and satisfy all dependencies before a step runs.
+        Checks Python packages, system binaries, and environment variables;
+        installs or configures anything missing, then returns so the step
+        can continue without ever seeing a missing-dependency error.
+        """
+        import importlib
+        import shutil
+
+        method     = state.serving_method or ""
+        step_type  = step.step_type
+
+        # ── 1. Python packages ────────────────────────────────────────────
+        pkgs_needed: list[str] = []
+
+        if step_type == "download_model":
+            pkgs_needed = ["huggingface_hub"]
+
+        elif step_type == "install_packages":
+            if method == "llama_cpp":
+                pkgs_needed = ["llama_cpp"]
+            elif method == "transformers":
+                pkgs_needed = ["transformers", "torch", "accelerate"]
+            elif method == "vllm":
+                pkgs_needed = ["vllm"]
+
+        elif step_type == "show_launch_info":
+            if method == "llama_cpp":
+                pkgs_needed = ["llama_cpp"]
+            elif method == "transformers":
+                pkgs_needed = ["transformers", "torch", "accelerate"]
+            elif method == "vllm":
+                pkgs_needed = ["vllm"]
+
+        for pkg in pkgs_needed:
+            # Strip extras ("llama_cpp[server]" → "llama_cpp")
+            mod = pkg.replace("-", "_").split("[")[0]
+            try:
+                importlib.import_module(mod)
+            except ImportError:
+                await self._log(f"[info]Missing: {pkg} — installing...[/info]")
+                ok, out = await self._try_pip_install([pkg])
+                if not ok:
+                    raise RuntimeError(
+                        f"Auto-install of '{pkg}' failed:\n{out[-500:]}"
+                    )
+                await self._log(f"[success]{pkg} installed.[/success]")
+
+        # ── 2. System binaries ────────────────────────────────────────────
+        if step_type in ("install_packages", "show_launch_info"):
+            if method == "ollama" and not shutil.which("ollama"):
+                await self._log("[info]ollama not found — installing automatically...[/info]")
+                if not await self._install_ollama():
+                    raise RuntimeError(
+                        "ollama auto-install failed. Install from https://ollama.com "
+                        "then re-run: mm --resume " + state.session_id[:8]
+                    )
+
+            elif method in ("llama_server", "llama_cli"):
+                binary = "llama-server" if method == "llama_server" else "llama-cli"
+                if not shutil.which(binary):
+                    await self._log(f"[info]{binary} not found — installing llama.cpp...[/info]")
+                    if not await self._install_llama_binary(binary):
+                        raise RuntimeError(
+                            f"{binary} could not be installed automatically. "
+                            "Download from https://github.com/ggerganov/llama.cpp/releases "
+                            "and add it to PATH, then re-run: mm --resume " + state.session_id[:8]
+                        )
+
+        # ── 3. Environment variables ──────────────────────────────────────
+        if step_type == "download_model":
+            # Speed up downloads when hf_transfer is available
+            try:
+                importlib.import_module("hf_transfer")
+                os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+            except ImportError:
+                pass
+            # Propagate HF token into both env var names the hub library checks
+            token = self._hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            if token:
+                os.environ["HF_TOKEN"] = token
+                os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+
     async def _execute_step(self, step: InstallStep, state: InstallationState) -> None:
         """Dispatch to the correct handler based on step_type."""
         import sys
         from model_manager.ui.console import console
+
+        await self._preflight_check(step, state)
 
         if step.step_type == "create_directories":
             install_path = Path(state.install_path or ".")
@@ -1313,43 +1536,26 @@ class App:
 
             elif method == "ollama":
                 import shutil
-                import sys as _sys
                 if shutil.which("ollama"):
-                    await self._log("[success]Ollama already installed.[/success]")
-                else:
-                    await self._log("[info]Ollama not found — installing automatically...[/info]")
-                    installed = await self._install_ollama()
-                    if not installed:
-                        raise RuntimeError(
-                            "Ollama installation failed. Please install manually from "
-                            "https://ollama.com and re-run: mm --resume " + state.session_id[:8]
-                        )
+                    await self._log("[success]Ollama ready.[/success]")
+                # else: _preflight_check already installed it before this step ran
 
             elif method == "docker":
-                from model_manager.ui.console import console
                 import shutil
                 if shutil.which("docker"):
-                    await self._log("[success]Docker already installed.[/success]")
+                    await self._log("[success]Docker ready.[/success]")
                 else:
-                    console.print("\n  [warning]Docker is not installed. Install it from:[/warning]")
-                    console.print("  [info]  https://docs.docker.com/get-docker/[/info]")
+                    from model_manager.ui.console import console
+                    console.print("\n  [warning]Docker is not installed.[/warning]")
+                    console.print("  Install from [info]https://docs.docker.com/get-docker/[/info]")
                     console.print()
 
             elif method in ("llama_server", "llama_cli"):
-                from model_manager.ui.console import console
                 import shutil
                 binary = "llama-server" if method == "llama_server" else "llama-cli"
                 if shutil.which(binary):
-                    await self._log(f"[success]{binary} already installed.[/success]")
-                else:
-                    await self._log(
-                        f"[info]{binary} is a native llama.cpp binary — install instructions below.[/info]"
-                    )
-                    console.print(f"\n  Install {binary}:")
-                    console.print(f"  [info]  macOS  :[/info]  brew install llama.cpp")
-                    console.print(f"  [info]  Linux  :[/info]  sudo apt install llama-cpp   # Ubuntu 24.04+")
-                    console.print(f"  [info]  Windows:[/info]  https://github.com/ggerganov/llama.cpp/releases")
-                    console.print()
+                    await self._log(f"[success]{binary} ready.[/success]")
+                # else: _preflight_check already installed it before this step ran
 
             step.artifacts["serving_method"] = method
 
