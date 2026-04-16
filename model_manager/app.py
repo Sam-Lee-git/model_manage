@@ -35,6 +35,23 @@ from model_manager.ui.chat import ChatInput
 from model_manager.ui.dashboard import Dashboard
 
 
+def _substitute_placeholders(diagnosis) -> None:
+    """Replace {{ENV_VAR}} tokens in fix_plan action_params with current os.environ values."""
+    import os
+    import re
+    _RE = re.compile(r"\{\{(\w+)\}\}")
+
+    def _sub(val):
+        if not isinstance(val, str):
+            return val
+        return _RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), val)
+
+    for step in diagnosis.fix_plan:
+        params = step.get("action_params", {})
+        for k, v in list(params.items()):
+            params[k] = _sub(v)
+
+
 def _is_connection_error(exc: Exception) -> bool:
     """Return True for network-level errors (not auth, rate-limit, or parse errors)."""
     type_name = type(exc).__name__.lower()
@@ -1047,6 +1064,17 @@ class App:
                         await sm.trigger("branch_needs_user")
                         return
 
+                    # If the LLM declared required user inputs, collect them before
+                    # running the branch so placeholder values get substituted.
+                    if diagnosis.user_inputs_needed:
+                        should_retry = await self._handle_user_intervention(
+                            step, diagnosis, state
+                        )
+                        if not should_retry:
+                            await sm.trigger("branch_needs_user")
+                            return
+                        _substitute_placeholders(diagnosis)
+
                     result = await executor.execute(diagnosis, ctx)
 
                     if result.success:
@@ -1774,61 +1802,79 @@ class App:
         state: InstallationState,
     ) -> bool:
         """
-        Show manual-action instructions when automated recovery fails.
-        Returns True if the failed step should be retried.
+        Collect any runtime values the LLM says it needs (tokens, passwords, paths),
+        apply them to the environment, then return True to trigger a retry.
+        Falls back to a plain "press Enter" prompt when no inputs are declared.
         """
         import os
+        import re as _re
         from model_manager.ui.console import console
 
         console.print("\n[header]── Manual Action Required ──[/header]")
         if diagnosis.user_explanation:
             console.print(f"[warning]{diagnosis.user_explanation}[/warning]")
 
-        root_cause = (diagnosis.root_cause or "").lower()
-        is_auth = (
-            diagnosis.error_category in ("auth_error", "access_denied")
-            or "401" in root_cause
-            or "token" in root_cause
-            or "huggingface" in root_cause
-            or "gated" in root_cause
-        )
+        # Show any browser/manual steps the LLM listed
+        if diagnosis.decision_options:
+            console.print("\n[header]Steps to complete in your browser:[/header]")
+            for idx, opt in enumerate(diagnosis.decision_options, 1):
+                console.print(f"  {idx}. {opt}")
 
-        if is_auth:
-            model_id = state.selected_model_id or ""
-            model_url = f"https://huggingface.co/{model_id}" if model_id else "https://huggingface.co"
-            console.print("\n[header]Steps to fix:[/header]")
-            console.print(f"  1. Open [info]{model_url}[/info] in your browser and accept the model license")
-            console.print("  2. Go to [info]https://huggingface.co/settings/tokens[/info] and create a read-scope token")
-            console.print("  3. Paste your token below — it will be used for this session only\n")
+        # -- Inject a default HF_TOKEN request when auth_error has no explicit inputs --
+        inputs_needed = list(diagnosis.user_inputs_needed or [])
+        if not inputs_needed:
+            root_cause = (diagnosis.root_cause or "").lower()
+            is_auth = (
+                diagnosis.error_category in ("auth_error", "access_denied")
+                or "401" in root_cause
+                or "token" in root_cause
+                or "huggingface" in root_cause
+                or "gated" in root_cause
+            )
+            if is_auth:
+                from model_manager.recovery.branch import UserInputRequest
+                inputs_needed = [UserInputRequest(
+                    env_var="HF_TOKEN",
+                    prompt="Paste your HuggingFace read token (get one at https://huggingface.co/settings/tokens): ",
+                    sensitive=True,
+                )]
 
-            raw_input = (await self._chat_input.get_input("HuggingFace token (or /cancel to abort): ")).strip()
-            if raw_input.lower() == "/cancel" or not raw_input:
+        # Collect each declared input interactively
+        collected: dict[str, str] = {}
+        for req in inputs_needed:
+            console.print()
+            raw = (await self._chat_input.get_input(req.prompt)).strip()
+            if raw.lower() == "/cancel" or not raw:
                 return False
 
-            # Extract bare token — user may paste surrounding text like "token: 'hf_xxx'"
-            import re as _re
-            m = _re.search(r"hf_[A-Za-z0-9]+", raw_input)
-            token = m.group(0) if m else raw_input.strip("'\"\t ")
+            value = raw.strip("'\"\t ")
 
-            if not token:
-                await self._log("[warning]No token found in input — please paste just the token.[/warning]")
-                return False
+            # Apply special normalisation per well-known key types
+            if req.env_var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+                m = _re.search(r"hf_[A-Za-z0-9]+", raw)
+                value = m.group(0) if m else value
+                if not value:
+                    await self._log("[warning]No valid token found — paste the token directly.[/warning]")
+                    return False
 
-            os.environ["HF_TOKEN"] = token
+            os.environ[req.env_var] = value
+            collected[req.env_var] = value
+            await self._log(f"[info]Set {req.env_var} ({'*' * min(len(value), 8)}...)[/info]")
+
+        # Post-collection validation for known key types
+        if "HF_TOKEN" in collected:
+            token = collected["HF_TOKEN"]
             os.environ["HUGGING_FACE_HUB_TOKEN"] = token
             self._hf_token = token
-            await self._log(f"[info]Token set ({token[:8]}...) — verifying access...[/info]")
-
-            # Verify the token actually works before retrying
-            model_id = state.selected_model_id or ""
+            await self._log("[info]Verifying HuggingFace token...[/info]")
             try:
                 from huggingface_hub import HfApi
                 api = HfApi(token=token)
                 user_info = await asyncio.to_thread(api.whoami)
                 username = user_info.get("name", "?")
-                await self._log(f"[success]Token valid (logged in as: {username})[/success]")
+                await self._log(f"[success]Token valid — logged in as: {username}[/success]")
 
-                # Check if the specific repo is accessible
+                model_id = state.selected_model_id or ""
                 if model_id:
                     try:
                         entry = self._catalog.get_by_id(model_id)
@@ -1839,7 +1885,6 @@ class App:
                         )
                     except Exception:
                         repo_to_check = model_id
-
                     try:
                         await asyncio.to_thread(api.repo_info, repo_to_check)
                         await self._log(f"[success]Repo access confirmed: {repo_to_check}[/success]")
@@ -1847,33 +1892,28 @@ class App:
                         err_str = str(repo_err)
                         if "403" in err_str or "401" in err_str:
                             await self._log(
-                                f"[warning]Token valid but repo access denied for {repo_to_check}.[/warning]\n"
-                                f"[warning]You may need to accept the license at: "
+                                f"[warning]Token valid but repo access denied for {repo_to_check}.\n"
+                                f"You may need to accept the license at: "
                                 f"https://huggingface.co/{repo_to_check}[/warning]"
                             )
                         elif "404" in err_str:
                             await self._log(
-                                f"[warning]Repo not found: {repo_to_check} — the repo ID in the catalog may be wrong.[/warning]"
+                                f"[warning]Repo not found: {repo_to_check} — the catalog entry may have a wrong repo ID.[/warning]"
                             )
-                        else:
-                            await self._log(f"[warning]Repo check: {repo_err}[/warning]")
             except Exception as e:
-                await self._log(f"[warning]Token may be invalid — whoami failed: {e}[/warning]")
+                await self._log(f"[warning]Token verification failed: {e} — will retry anyway.[/warning]")
 
-            await self._log("[info]Retrying download...[/info]")
+        # If the LLM declared inputs and we collected them all, retry immediately
+        if inputs_needed:
+            await self._log("[info]Inputs collected — retrying...[/info]")
             return True
 
-        # Generic: list required manual steps then ask to retry
-        if diagnosis.requires_user_decision and diagnosis.decision_options:
-            console.print("\n[header]Steps to fix:[/header]")
-            for i, opt in enumerate(diagnosis.decision_options, 1):
-                console.print(f"  {i}. {opt}")
-
+        # Pure manual steps with no declared inputs — ask user to confirm readiness
         console.print()
-        raw = (await self._chat_input.get_input("Press Enter to retry after completing the steps above (or /cancel to abort): ")).strip()
-        if raw.lower() == "/cancel":
-            return False
-        return True
+        raw = (await self._chat_input.get_input(
+            "Press Enter when ready to retry (or /cancel to abort): "
+        )).strip()
+        return raw.lower() != "/cancel"
 
     async def _log(self, message: str) -> None:
         await bus.emit(LogLineEvent(level="info", message=message))

@@ -9,7 +9,7 @@ from typing import Optional
 from model_manager.agent.base import LLMClient
 from model_manager.core.exceptions import DiagnosisFailedError
 from model_manager.core.events import DiagnosisStartedEvent, DiagnosisReadyEvent, bus
-from model_manager.recovery.branch import DiagnosisResult
+from model_manager.recovery.branch import DiagnosisResult, UserInputRequest
 from model_manager.recovery.context import ErrorContext
 
 
@@ -75,6 +75,17 @@ class ErrorDiagnosisAgent:
         except json.JSONDecodeError as e:
             raise DiagnosisFailedError(f"JSON parse error: {e}\n{json_str[:500]}")
 
+        raw_inputs = data.get("user_inputs_needed", [])
+        user_inputs = [
+            UserInputRequest(
+                env_var=r.get("env_var", r.get("key", "")),
+                prompt=r.get("prompt", f"Enter value for {r.get('env_var', r.get('key', ''))}"),
+                sensitive=bool(r.get("sensitive", True)),
+            )
+            for r in raw_inputs
+            if r.get("env_var") or r.get("key")
+        ]
+
         result = DiagnosisResult(
             error_category=data.get("error_category", "unknown"),
             root_cause=data.get("root_cause", ""),
@@ -84,6 +95,7 @@ class ErrorDiagnosisAgent:
             user_explanation=data.get("user_explanation", ""),
             requires_user_decision=data.get("requires_user_decision", False),
             decision_options=data.get("decision_options", []),
+            user_inputs_needed=user_inputs,
         )
 
         await bus.emit(DiagnosisReadyEvent(

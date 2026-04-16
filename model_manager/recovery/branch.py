@@ -23,19 +23,30 @@ from model_manager.state.store import StateStore
 
 
 @dataclass
+class UserInputRequest:
+    """One piece of information the LLM needs from the user before retrying."""
+    env_var: str        # os.environ key to set (e.g. "HF_TOKEN")
+    prompt: str         # text shown to the user
+    sensitive: bool = True   # mask input (like a password)
+
+
+@dataclass
 class DiagnosisResult:
     error_category: str
     root_cause: str
     confidence: float
-    fix_plan: list[dict[str, Any]]          # raw dicts from Claude
+    fix_plan: list[dict[str, Any]]
     alternative_plans: list[list[dict[str, Any]]]
     user_explanation: str
     requires_user_decision: bool = False
     decision_options: list[str] = None
+    user_inputs_needed: list[UserInputRequest] = None
 
     def __post_init__(self):
         if self.decision_options is None:
             self.decision_options = []
+        if self.user_inputs_needed is None:
+            self.user_inputs_needed = []
 
 
 @dataclass
