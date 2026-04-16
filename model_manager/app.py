@@ -240,9 +240,13 @@ class App:
                     f"[muted]Validated and registered {len(added)} model(s): "
                     + ", ".join(added) + "[/muted]"
                 )
+                # Show a numbered pick-list so the user can select explicitly.
+                # Do NOT auto-select — wait for a follow-up message.
+                self._print_model_list(added)
 
             # Priority: user's explicit text mention > LLM signal
-            # This prevents the LLM from picking the wrong variant (e.g. 4B when user said 1B)
+            # _fuzzy_match_model_from_text only fires when the user message contains
+            # a clear install intent (install / yes / ok / a number, etc.).
             model_entry = self._fuzzy_match_model_from_text(text)
             if model_entry is None:
                 model_entry = await self._try_parse_install_signal(response)
@@ -1960,14 +1964,41 @@ class App:
             return m.group(1).rstrip("\\/ \t")
         return None
 
+    def _print_model_list(self, model_ids: list[str]) -> None:
+        """Print a numbered list of recommended models so the user can pick one."""
+        from model_manager.ui.console import console
+        console.print("\n[header]── Recommended models ──[/header]")
+        for idx, mid in enumerate(model_ids, 1):
+            try:
+                entry = self._catalog.get_by_id(mid)
+                quant = entry.quantizations[0] if entry.quantizations else None
+                size_str = f"{entry.parameter_count_b:.0f}B" if entry.parameter_count_b else ""
+                q_str    = f"  [{quant.quant_type}  {quant.file_size_gb:.1f} GB]" if quant else ""
+                console.print(f"  [bold]{idx}.[/bold] [model]{entry.display_name}[/model]"
+                               f"  {size_str}{q_str}")
+            except Exception:
+                console.print(f"  [bold]{idx}.[/bold] {mid}")
+        console.print("\n[muted]Type a number (1, 2 …) or say 'install <name>' to proceed.[/muted]\n")
+
     def _fuzzy_match_model_from_text(self, text: str):
         """
-        Match a model from user text using family + size hints.
-        E.g. 'gemma4 1b' → google/gemma-4-1b-it, '7b llama' → Llama 7B entry.
-        Priority: exact size+family > partial match.
+        Match a model from user text using family + size hints, but only when
+        the message contains an explicit install intent.
+        E.g. 'install gemma 1b' or 'ok, go with the 4b one'.
         """
         import re
         text_lower = text.lower()
+
+        # Require an explicit install/confirm intent to avoid premature selection
+        # when the user is still exploring (e.g. "how about gemma?").
+        _INTENT = (
+            "install", "download", "go with", "use ", "take ", "pick ",
+            "get ", "proceed", "confirm", "let's", "yes", "ok ", "sure",
+            "setup", "set up",
+        )
+        if not any(kw in text_lower for kw in _INTENT):
+            return None
+
         # Extract size hint: "1b", "4b", "7b", "12b", "27b" etc.
         size_m = re.search(r"(\d+\.?\d*)\s*b\b", text_lower)
         size_str = size_m.group(1) if size_m else None
