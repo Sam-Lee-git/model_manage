@@ -328,6 +328,21 @@ class App:
                 note        = parts.get("note", "")
                 vendor      = repo_id.split("/")[0] if "/" in repo_id else "unknown"
 
+                # Code enforces hardware constraints — hard-reject models the hardware cannot run
+                if self._hardware:
+                    if min_vram > self._hardware.total_vram_gb:
+                        await self._log(
+                            f"[warning]Skipping {repo_id} — requires {min_vram:.1f} GB VRAM "
+                            f"(available: {self._hardware.total_vram_gb:.1f} GB)[/warning]"
+                        )
+                        continue
+                    if min_ram > self._hardware.ram_available_gb:
+                        await self._log(
+                            f"[warning]Skipping {repo_id} — requires {min_ram:.1f} GB RAM "
+                            f"(available: {self._hardware.ram_available_gb:.1f} GB)[/warning]"
+                        )
+                        continue
+
                 quant = QuantizationOption(
                     quant_type=quant_type,
                     file_size_gb=file_size,
@@ -684,7 +699,7 @@ class App:
 
         planner = StoragePlanner()
         suggestions = planner.suggest(self._hardware, required_gb, model_entry.display_name)
-        best = suggestions[0]
+        best = await self._llm_pick_install_path(suggestions, model_entry, required_gb)
         state.install_path = str(best.path)
         self._store.save(state)
         await self._log(f"Suggested install path: {best.path}  ({best.reason})")
@@ -746,6 +761,106 @@ class App:
         await sm.trigger("backend_selected")
         await sm.trigger("repos_resolved")
 
+    # ── LLM-driven decision helpers ───────────────────────────────────────────
+
+    async def _llm_recommend_backend(
+        self,
+        model_id: str,
+        is_gguf: bool,
+        has_nvidia: bool,
+        has_amd: bool,
+    ) -> tuple[str, str]:
+        """Let the LLM pick the best installation method; fall back to heuristics."""
+        def _heuristic() -> tuple[str, str]:
+            if is_gguf:
+                if has_nvidia:
+                    return "llama_cpp", "GGUF + NVIDIA GPU — CUDA-accelerated, full control"
+                if has_amd:
+                    return "llama_cpp", "GGUF + AMD GPU — ROCm-accelerated via llama-cpp-python"
+                return "ollama", "GGUF + CPU — Ollama is easiest, includes a built-in API server"
+            if has_nvidia:
+                return "vllm", "Safetensors + NVIDIA GPU — vLLM gives the fastest OpenAI-compatible API"
+            return "transformers", "Safetensors + CPU — HuggingFace Transformers is the standard choice"
+
+        if not self._conversation:
+            return _heuristic()
+
+        import json as _json
+        hw_str = self._format_hardware_for_llm()
+        valid_keys = ["llama_cpp", "ollama", "docker", "llama_server", "llama_cli", "transformers", "vllm"]
+        opts_str = "\n".join([
+            "- llama_cpp: llama-cpp-python  — GGUF · Python API · CUDA/ROCm/CPU",
+            "- ollama: Ollama               — GGUF · easiest setup · built-in API · CUDA/CPU",
+            "- docker: Docker + llama.cpp   — GGUF · isolated server · CUDA",
+            "- llama_server: llama-server   — GGUF · native HTTP server · CUDA/ROCm/CPU",
+            "- llama_cli: llama-cli         — GGUF · interactive CLI · CUDA/ROCm/CPU",
+            "- transformers: HF Transformers — safetensors · any GPU",
+            "- vllm: vLLM                   — safetensors · fast OpenAI API · CUDA only",
+        ])
+        prompt = (
+            f"Model: {model_id}  ({'GGUF format' if is_gguf else 'HF safetensors format'})\n"
+            f"Hardware:\n{hw_str}\n\n"
+            f"Available installation backends:\n{opts_str}\n\n"
+            "Pick the single best backend for this hardware and model. "
+            "Consider ease of setup, GPU utilization, and whether an API server is needed.\n"
+            'Respond with JSON only: {"choice": "<key>", "reason": "<one sentence>"}'
+        )
+        try:
+            raw = await self._conversation._client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                system="You are a technical assistant selecting the best AI model deployment method. Reply with valid JSON only, no markdown fences.",
+                max_tokens=200,
+            )
+            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            data = _json.loads(raw)
+            choice = data.get("choice", "").strip()
+            reason = data.get("reason", "")
+            if choice in valid_keys:
+                return choice, reason
+        except Exception:
+            pass
+        return _heuristic()
+
+    async def _llm_pick_install_path(
+        self,
+        candidates: list,
+        model_entry,
+        required_gb: float,
+    ):
+        """Let the LLM choose the best install path; fall back to top-scored candidate."""
+        if len(candidates) == 1 or not self._conversation:
+            return candidates[0]
+
+        import json as _json
+        opts_str = "\n".join(
+            f"- {s.path}  ({s.available_gb:.1f} GB free — {s.reason})"
+            for s in candidates
+        )
+        prompt = (
+            f"I need to choose where to install '{model_entry.display_name}' "
+            f"({required_gb:.1f} GB required).\n\n"
+            f"Available paths:\n{opts_str}\n\n"
+            "Pick the best path. Prefer user home directories over system paths, "
+            "and ensure there is comfortable headroom beyond the minimum.\n"
+            'Respond with JSON only: {"path": "<absolute_path>", "reason": "<one sentence>"}'
+        )
+        try:
+            raw = await self._conversation._client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                system="You are a technical assistant. Reply with valid JSON only, no markdown fences.",
+                max_tokens=200,
+            )
+            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            data = _json.loads(raw)
+            chosen = data.get("path", "").strip()
+            # Code constraint: chosen path must be one of the validated candidates
+            for s in candidates:
+                if str(s.path) == chosen:
+                    return s
+        except Exception:
+            pass
+        return candidates[0]
+
     # ── Serving method selection ───────────────────────────────────────────────
 
     def _is_gguf_model(self, model_id: str) -> bool:
@@ -786,19 +901,8 @@ class App:
             hw_parts.append(f"{self._hardware.ram_total_gb:.0f} GB RAM")
         hw_str = ",  ".join(hw_parts) if hw_parts else "unknown"
 
-        # ── Recommendation logic ───────────────────────────────────────────
-        if is_gguf:
-            if has_nvidia:
-                rec, rec_reason = "llama_cpp", "GGUF + NVIDIA GPU — CUDA-accelerated, full control"
-            elif has_amd:
-                rec, rec_reason = "llama_cpp", "GGUF + AMD GPU — ROCm-accelerated via llama-cpp-python"
-            else:
-                rec, rec_reason = "ollama",    "GGUF + CPU — Ollama is easiest, includes a built-in API server"
-        else:
-            if has_nvidia:
-                rec, rec_reason = "vllm",         "Safetensors + NVIDIA GPU — vLLM gives the fastest OpenAI-compatible API"
-            else:
-                rec, rec_reason = "transformers", "Safetensors + CPU — HuggingFace Transformers is the standard choice"
+        # ── LLM decides recommendation; code defines the valid option set ────
+        rec, rec_reason = await self._llm_recommend_backend(model_id, is_gguf, has_nvidia, has_amd)
 
         # ── Options table ──────────────────────────────────────────────────
         # (key, display name, best-for description, GPU, includes API server, native fit)
