@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> None:
         console.print("[muted]Set one of:[/muted]")
         for env_var in PROVIDER_ENV_VARS.values():
             console.print(f"  [muted]{env_var}[/muted]")
-        console.print("[muted](Continuing with simple mode — no AI assistance)[/muted]\n")
+        console.print("[muted](You will be asked whether to configure an LLM before model recommendations.)[/muted]\n")
     else:
         active_provider = available[0][0]
         all_names = ", ".join(p.value for p, _ in available)

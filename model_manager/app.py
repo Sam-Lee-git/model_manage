@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import time
 from pathlib import Path
 from typing import Optional
@@ -475,7 +476,7 @@ class App:
         Try to start the LLM conversation, with layered recovery:
           1. No API key      → prompt user to pick provider + enter key, then retry
           2. Connection error → offer proxy setup / retry / switch provider
-          3. Other errors    → log and return False (caller falls back to simple selection)
+          3. Other errors    → ask before falling back to simple selection
         Returns True when self._conversation is ready to use.
         """
         exc = await self._try_start_conversation(system_prompt)
@@ -486,7 +487,9 @@ class App:
         if isinstance(exc, APIKeyMissingError):
             provided = await self._prompt_api_key_setup()
             if not provided:
-                await self._log("[warning]No API key provided — using simple model selection.[/warning]")
+                await self._log(
+                    "[warning]No API key configured — continuing without AI recommendations.[/warning]"
+                )
                 return False
             exc = await self._try_start_conversation(system_prompt)
             if exc is None:
@@ -498,10 +501,56 @@ class App:
 
         # ── Layer 3: anything else (wrong key format, SDK version, etc.) ──────
         if exc is not None:
-            await self._log(f"[warning]LLM unavailable ({exc}) — using simple model selection.[/warning]")
-            return False
+            return await self._handle_llm_startup_error(exc, system_prompt)
 
         return True
+
+    async def _handle_llm_startup_error(self, exc: Exception, system_prompt: str) -> bool:
+        """
+        Called when an LLM key exists but the LLM client cannot start.
+        Do not silently continue to recommendations; ask the user what to do.
+        """
+        from model_manager.ui.console import console
+
+        while True:
+            console.print("\n[header]── LLM Startup Failed ──[/header]")
+            console.print(f"  [warning]{exc}[/warning]\n")
+            console.print("  AI-powered recommendations are unavailable.")
+            console.print("  1. Retry current LLM provider")
+            console.print("  2. Configure or switch LLM provider")
+            console.print("  3. Continue without AI recommendations")
+            console.print("  4. Exit\n")
+
+            raw = (await self._chat_input.get_input("Choice [1-4]: ")).strip()
+
+            if raw == "1":
+                exc = await self._try_start_conversation(system_prompt)
+                if exc is None:
+                    await self._log("[success]LLM connected.[/success]")
+                    return True
+                await self._log(f"[warning]Still unavailable: {exc}[/warning]")
+                continue
+
+            if raw == "2":
+                provided = await self._prompt_api_key_setup()
+                if not provided:
+                    await self._log("[warning]No API key configured.[/warning]")
+                    continue
+                exc = await self._try_start_conversation(system_prompt)
+                if exc is None:
+                    await self._log("[success]LLM connected.[/success]")
+                    return True
+                await self._log(f"[warning]Still unavailable: {exc}[/warning]")
+                continue
+
+            if raw == "3":
+                await self._log("[warning]Continuing without AI recommendations.[/warning]")
+                return False
+
+            if raw == "4" or raw.lower() in ("/exit", "/cancel"):
+                raise KeyboardInterrupt
+
+            console.print("[warning]Please enter a number between 1 and 4.[/warning]")
 
     async def _handle_connection_error(self, exc: Exception, system_prompt: str) -> bool:
         """
@@ -512,59 +561,69 @@ class App:
         import os
         from model_manager.ui.console import console
 
-        console.print("\n[header]── Network Connection Failed ──[/header]")
-        console.print(f"  [warning]{exc}[/warning]\n")
-        console.print("  Cannot reach the LLM API. Common causes:")
-        console.print("  • No internet connection")
-        console.print("  • Firewall or VPN blocking the API endpoint")
-        console.print("  • HTTP/HTTPS proxy required in your network\n")
-        console.print("  1. Retry                    (check your connection first)")
-        console.print("  2. Set HTTP proxy            (e.g. http://127.0.0.1:7890)")
-        console.print("  3. Switch LLM provider      (try DeepSeek, OpenAI, etc.)")
-        console.print("  4. Continue without AI      (simple model list)\n")
+        while True:
+            console.print("\n[header]── Network Connection Failed ──[/header]")
+            console.print(f"  [warning]{exc}[/warning]\n")
+            console.print("  Cannot reach the LLM API. Common causes:")
+            console.print("  • No internet connection")
+            console.print("  • Firewall or VPN blocking the API endpoint")
+            console.print("  • HTTP/HTTPS proxy required in your network\n")
+            console.print("  1. Retry                    (check your connection first)")
+            console.print("  2. Set HTTP proxy            (e.g. http://127.0.0.1:7890)")
+            console.print("  3. Switch LLM provider      (try DeepSeek, OpenAI, etc.)")
+            console.print("  4. Continue without AI      (simple model list)")
+            console.print("  5. Exit\n")
 
-        raw = (await self._chat_input.get_input("Choice [1-4]: ")).strip()
+            raw = (await self._chat_input.get_input("Choice [1-5]: ")).strip()
 
-        if raw == "1":
-            exc2 = await self._try_start_conversation(system_prompt)
-            if exc2 is None:
-                await self._log("[success]Connected.[/success]")
-                return True
-            await self._log(f"[warning]Still unreachable: {exc2}[/warning]")
-            return False
+            if raw == "1":
+                exc = await self._try_start_conversation(system_prompt)
+                if exc is None:
+                    await self._log("[success]Connected.[/success]")
+                    return True
+                await self._log(f"[warning]Still unreachable: {exc}[/warning]")
+                continue
 
-        elif raw == "2":
-            proxy = (await self._chat_input.get_input(
-                "  Proxy URL (e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:1080): "
-            )).strip()
-            if not proxy:
+            if raw == "2":
+                proxy = (await self._chat_input.get_input(
+                    "  Proxy URL (e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:1080): "
+                )).strip()
+                if not proxy:
+                    await self._log("[warning]No proxy entered.[/warning]")
+                    continue
+                os.environ["HTTPS_PROXY"] = proxy
+                os.environ["HTTP_PROXY"]  = proxy
+                await self._log(f"[info]Proxy set: {proxy} — retrying...[/info]")
+                exc = await self._try_start_conversation(system_prompt)
+                if exc is None:
+                    await self._log("[success]Connected via proxy.[/success]")
+                    return True
+                await self._log(f"[warning]Still unreachable with proxy: {exc}[/warning]")
+                continue
+
+            if raw == "3":
+                provided = await self._prompt_api_key_setup()
+                if not provided:
+                    await self._log("[warning]No API key configured.[/warning]")
+                    continue
+                exc = await self._try_start_conversation(system_prompt)
+                if exc is None:
+                    await self._log("[success]Connected.[/success]")
+                    return True
+                if _is_connection_error(exc):
+                    await self._log(f"[warning]Still unreachable: {exc}[/warning]")
+                else:
+                    return await self._handle_llm_startup_error(exc, system_prompt)
+                continue
+
+            if raw == "4":
+                await self._log("[warning]Continuing without AI recommendations.[/warning]")
                 return False
-            os.environ["HTTPS_PROXY"] = proxy
-            os.environ["HTTP_PROXY"]  = proxy
-            await self._log(f"[info]Proxy set: {proxy} — retrying...[/info]")
-            exc2 = await self._try_start_conversation(system_prompt)
-            if exc2 is None:
-                await self._log("[success]Connected via proxy.[/success]")
-                return True
-            await self._log(f"[warning]Still unreachable with proxy: {exc2}[/warning]")
-            return False
 
-        elif raw == "3":
-            provided = await self._prompt_api_key_setup()
-            if not provided:
-                return False
-            exc2 = await self._try_start_conversation(system_prompt)
-            if exc2 is None:
-                await self._log("[success]Connected.[/success]")
-                return True
-            if _is_connection_error(exc2):
-                await self._log(f"[warning]Still unreachable: {exc2}[/warning]")
-            else:
-                await self._log(f"[warning]LLM unavailable: {exc2}[/warning]")
-            return False
+            if raw == "5" or raw.lower() in ("/exit", "/cancel"):
+                raise KeyboardInterrupt
 
-        # option 4 or invalid input
-        return False
+            console.print("[warning]Please enter a number between 1 and 5.[/warning]")
 
     async def _prompt_api_key_setup(self) -> bool:
         """
@@ -614,8 +673,9 @@ class App:
             await self._log("[warning]Empty key — skipping.[/warning]")
             return False
 
+        os.environ["MM_LLM_PROVIDER"] = provider.value
         os.environ[env_var] = key
-        await self._log(f"[success]{name} API key set ({key[:8]}...) — continuing.[/success]")
+        await self._log(f"[success]{name} selected and API key set ({key[:8]}...) — continuing.[/success]")
         return True
 
     # ── HuggingFace model search ───────────────────────────────────────────────
@@ -1473,6 +1533,7 @@ class App:
         await sm.trigger("download_complete")
         await sm.trigger("verified")
         await self._log("[success]Installation complete![/success]")
+        await self._auto_launch_installed_model(state)
 
     def _build_steps(self, state: InstallationState) -> list[InstallStep]:
         model_id = state.selected_model_id or "unknown"
@@ -1481,7 +1542,7 @@ class App:
             InstallStep("install_deps",  "install_packages",   "Install huggingface_hub and llama-cpp-python"),
             InstallStep("download_model","download_model",      f"Download {model_id} from HuggingFace"),
             InstallStep("verify",        "verify_install",     "Verify downloaded files"),
-            InstallStep("launch_info",   "show_launch_info",   "Show how to launch the model"),
+            InstallStep("launch_info",   "show_launch_info",   "Write startup script and show launch guide"),
         ]
 
     async def _preflight_check(self, step: InstallStep, state: InstallationState) -> None:
@@ -1696,6 +1757,7 @@ class App:
             )
             step.artifacts["downloaded_path"] = str(downloaded)
             await self._log(f"[success]Downloaded to: {downloaded}[/success]")
+            await self._log("[info]Download finished. Verifying files next...[/info]")
 
         elif step.step_type == "verify_install":
             downloaded = None
@@ -1707,64 +1769,250 @@ class App:
                     f.stat().st_size for f in Path(downloaded).rglob("*") if f.is_file()
                 ) / 1e9 if Path(downloaded).is_dir() else Path(downloaded).stat().st_size / 1e9
                 await self._log(f"[success]Verified: {downloaded}  ({size_gb:.2f} GB)[/success]")
+                await self._log("[info]Preparing startup script and launch guide...[/info]")
             else:
                 await self._log("[warning]Could not verify — file path not found.[/warning]")
 
         elif step.step_type == "show_launch_info":
-            downloaded = None
-            for s in state.steps:
-                if s.step_type == "download_model":
-                    downloaded = s.artifacts.get("downloaded_path")
-            model_id   = state.selected_model_id or ""
-            short_name = model_id.split("/")[-1].lower().replace(".", "-")
+            (
+                model_id, short_name,
+                gguf_file, gguf_dir, non_gguf_dir, num_shards,
+                has_nvidia, has_amd, ngl_flag,
+            ) = self._resolve_launch_context(state)
 
-            # Detect model type
-            gguf_file: Optional[str] = None
-            gguf_dir:  Optional[str] = None
-            num_shards = 0
-            non_gguf_dir: Optional[str] = None
-
-            if downloaded:
-                dl = Path(downloaded)
-                if dl.suffix.lower() == ".gguf" and dl.is_file():
-                    gguf_file = str(dl)
-                    gguf_dir  = str(dl.parent)
-                    num_shards = 1
-                elif dl.is_dir():
-                    shards = sorted(dl.glob("*.gguf"))
-                    if shards:
-                        gguf_file  = str(shards[0])
-                        gguf_dir   = str(dl)
-                        num_shards = len(shards)
-                    else:
-                        non_gguf_dir = str(dl)
-
-            has_nvidia = bool(self._hardware and self._hardware.has_nvidia_gpu)
-            has_amd    = bool(self._hardware and self._hardware.has_amd_gpu)
-            ngl_flag   = " --n-gpu-layers -1" if (has_nvidia or has_amd) else ""
+            startup_script = await self._write_startup_script(
+                state, model_id, short_name,
+                gguf_file, gguf_dir, non_gguf_dir,
+                has_nvidia, has_amd,
+            )
+            if startup_script:
+                step.artifacts["startup_script"] = str(startup_script)
 
             await self._show_launch_guide(
                 state, model_id, short_name,
                 gguf_file, gguf_dir, non_gguf_dir, num_shards,
-                has_nvidia, has_amd, ngl_flag,
+                has_nvidia, has_amd, ngl_flag, startup_script,
             )
 
-            raw = (await self._chat_input.get_input(
-                "\nLaunch the model now? [Y/n]: "
-            )).strip().lower()
-            if raw in ("", "y", "yes"):
-                await self._launch_model(
-                    state, model_id, short_name,
-                    gguf_file, gguf_dir, non_gguf_dir,
-                    has_nvidia, has_amd, ngl_flag,
-                )
+            await self._log("[info]The model will start automatically after installation completes.[/info]")
 
     # ── Launch guide & model runner ───────────────────────────────────────────
+
+    def _resolve_launch_context(self, state):
+        downloaded = None
+        for s in state.steps:
+            if s.step_type == "download_model":
+                downloaded = s.artifacts.get("downloaded_path")
+
+        model_id   = state.selected_model_id or ""
+        short_name = model_id.split("/")[-1].lower().replace(".", "-")
+
+        gguf_file: Optional[str] = None
+        gguf_dir:  Optional[str] = None
+        num_shards = 0
+        non_gguf_dir: Optional[str] = None
+
+        if downloaded:
+            dl = Path(downloaded)
+            if dl.suffix.lower() == ".gguf" and dl.is_file():
+                gguf_file = str(dl)
+                gguf_dir  = str(dl.parent)
+                num_shards = 1
+            elif dl.is_dir():
+                shards = sorted(dl.glob("*.gguf"))
+                if shards:
+                    gguf_file  = str(shards[0])
+                    gguf_dir   = str(dl)
+                    num_shards = len(shards)
+                else:
+                    non_gguf_dir = str(dl)
+
+        has_nvidia = bool(self._hardware and self._hardware.has_nvidia_gpu)
+        has_amd    = bool(self._hardware and self._hardware.has_amd_gpu)
+        ngl_flag   = " --n-gpu-layers -1" if (has_nvidia or has_amd) else ""
+
+        return (
+            model_id, short_name,
+            gguf_file, gguf_dir, non_gguf_dir, num_shards,
+            has_nvidia, has_amd, ngl_flag,
+        )
+
+    async def _auto_launch_installed_model(self, state: InstallationState) -> None:
+        (
+            model_id, short_name,
+            gguf_file, gguf_dir, non_gguf_dir, _num_shards,
+            has_nvidia, has_amd, ngl_flag,
+        ) = self._resolve_launch_context(state)
+
+        await self._log(
+            "[info]Starting the model now. Press Ctrl+C to stop it; "
+            "run the startup script printed above to start it again later.[/info]"
+        )
+        await self._launch_model(
+            state, model_id, short_name,
+            gguf_file, gguf_dir, non_gguf_dir,
+            has_nvidia, has_amd, ngl_flag,
+        )
+
+    @staticmethod
+    def _safe_script_stem(value: str) -> str:
+        import re
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+        return stem or "model"
+
+    async def _write_startup_script(
+        self, state, model_id, short_name,
+        gguf_file, gguf_dir, non_gguf_dir,
+        has_nvidia, has_amd,
+    ) -> Optional[Path]:
+        """Write a reusable shell script that starts the installed model."""
+        import sys
+
+        method = state.serving_method or ("llama_server" if gguf_file else "transformers")
+        model_path = gguf_file or non_gguf_dir or model_id
+
+        script_dir = Path(
+            gguf_dir
+            or non_gguf_dir
+            or state.install_path
+            or "."
+        )
+        if gguf_file:
+            script_dir = Path(gguf_file).parent
+        script_dir.mkdir(parents=True, exist_ok=True)
+
+        script_path = script_dir / f"start_{self._safe_script_stem(short_name)}.sh"
+        gpu_layers = bool(has_nvidia or has_amd)
+        q = shlex.quote
+
+        if method == "llama_cli" and gguf_file:
+            gpu_arg = " --n-gpu-layers -1" if gpu_layers else ""
+            body = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "if ! command -v llama-cli >/dev/null 2>&1; then\n"
+                "  echo \"llama-cli not found in PATH. Install llama.cpp first.\" >&2\n"
+                "  exit 1\n"
+                "fi\n"
+                f"exec llama-cli -m {q(gguf_file)} -cnv -c 4096{gpu_arg}\n"
+            )
+
+        elif method == "llama_server" and gguf_file:
+            gpu_arg = " --n-gpu-layers -1" if gpu_layers else ""
+            body = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "if ! command -v llama-server >/dev/null 2>&1; then\n"
+                "  echo \"llama-server not found in PATH. Install llama.cpp first.\" >&2\n"
+                "  exit 1\n"
+                "fi\n"
+                "echo \"Starting server at http://localhost:8080/v1\"\n"
+                f"exec llama-server -m {q(gguf_file)} --host 0.0.0.0 --port 8080 -c 4096{gpu_arg}\n"
+            )
+
+        elif method == "llama_cpp" and gguf_file:
+            gpu_arg = " --n_gpu_layers -1" if gpu_layers else ""
+            body = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"PYTHON_BIN=${{PYTHON_BIN:-{q(sys.executable)}}}\n"
+                "echo \"Starting server at http://localhost:8000/v1\"\n"
+                f"exec \"$PYTHON_BIN\" -m llama_cpp.server --model {q(gguf_file)} "
+                f"--n_ctx 4096 --host 0.0.0.0 --port 8000{gpu_arg}\n"
+            )
+
+        elif method == "ollama":
+            src = gguf_dir or non_gguf_dir or model_id
+            body = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "if ! command -v ollama >/dev/null 2>&1; then\n"
+                "  echo \"ollama not found in PATH. Install Ollama first.\" >&2\n"
+                "  exit 1\n"
+                "fi\n"
+                f"MODEL_NAME={q(short_name)}\n"
+                "MODEFILE=\"$(mktemp)\"\n"
+                "trap 'rm -f \"$MODEFILE\"' EXIT\n"
+                "cat > \"$MODEFILE\" <<'MM_MODELFILE'\n"
+                f"FROM {src}\n"
+                "PARAMETER num_ctx 4096\n"
+                "MM_MODELFILE\n"
+                "ollama create \"$MODEL_NAME\" -f \"$MODEFILE\" >/dev/null\n"
+                "exec ollama run \"$MODEL_NAME\"\n"
+            )
+
+        elif method == "transformers":
+            body = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"PYTHON_BIN=${{PYTHON_BIN:-{q(sys.executable)}}}\n"
+                f"MODEL_PATH={q(model_path)}\n"
+                "export MODEL_PATH\n"
+                "exec \"$PYTHON_BIN\" - <<'PY'\n"
+                "import os\n"
+                "from transformers import pipeline\n"
+                "\n"
+                "pipe = pipeline(\"text-generation\", model=os.environ[\"MODEL_PATH\"], device_map=\"auto\")\n"
+                "print(\"Model loaded. Type /exit to quit.\")\n"
+                "while True:\n"
+                "    user = input(\"You: \")\n"
+                "    if user.lower() in (\"/exit\", \"/quit\"):\n"
+                "        break\n"
+                "    out = pipe([{\"role\": \"user\", \"content\": user}], max_new_tokens=512)\n"
+                "    generated = out[0].get(\"generated_text\")\n"
+                "    if isinstance(generated, list):\n"
+                "        last = generated[-1]\n"
+                "        print(\"AI:\", last.get(\"content\", last) if isinstance(last, dict) else last)\n"
+                "    else:\n"
+                "        print(\"AI:\", generated)\n"
+                "PY\n"
+            )
+
+        elif method == "vllm":
+            body = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"PYTHON_BIN=${{PYTHON_BIN:-{q(sys.executable)}}}\n"
+                "echo \"Starting server at http://localhost:8000/v1\"\n"
+                f"exec \"$PYTHON_BIN\" -m vllm.entrypoints.openai.api_server "
+                f"--model {q(model_path)} --host 0.0.0.0 --port 8000\n"
+            )
+
+        elif method == "docker" and gguf_file:
+            img = "ghcr.io/ggerganov/llama.cpp:server-cuda" if has_nvidia else "ghcr.io/ggerganov/llama.cpp:server"
+            gpu_arg = " --gpus all" if has_nvidia else ""
+            body = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "if ! command -v docker >/dev/null 2>&1; then\n"
+                "  echo \"docker not found in PATH. Install Docker first.\" >&2\n"
+                "  exit 1\n"
+                "fi\n"
+                f"docker pull {q(img)}\n"
+                "echo \"Starting server at http://localhost:8080/v1\"\n"
+                f"exec docker run --rm{gpu_arg} -p 8080:8080 "
+                f"-v {q(str(Path(gguf_file).parent) + ':/models:ro')} {q(img)} "
+                f"-m {q('/models/' + Path(gguf_file).name)} --host 0.0.0.0 --port 8080 -c 4096\n"
+            )
+
+        else:
+            body = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"echo \"Auto-start is not supported for method: {method}\" >&2\n"
+                "exit 1\n"
+            )
+
+        script_path.write_text(body, encoding="utf-8")
+        script_path.chmod(0o755)
+        await self._log(f"[success]Startup script written: {script_path}[/success]")
+        await self._log(f"[info]Start later with: bash {script_path}[/info]")
+        return script_path
 
     async def _show_launch_guide(
         self, state, model_id, short_name,
         gguf_file, gguf_dir, non_gguf_dir, num_shards,
-        has_nvidia, has_amd, ngl_flag,
+        has_nvidia, has_amd, ngl_flag, startup_script: Optional[Path] = None,
     ) -> None:
         """Print a focused launch guide for the chosen serving method."""
         from model_manager.ui.console import console
@@ -1782,6 +2030,9 @@ class App:
         elif non_gguf_dir:
             console.print(f"  Format   : HuggingFace safetensors")
             console.print(f"  Location : {non_gguf_dir}")
+        if startup_script:
+            console.print(f"  Startup  : {startup_script}")
+            console.print(f"  Run later: bash {startup_script}")
         console.print()
 
         gpu_layers_py  = "\n      n_gpu_layers=-1," if (has_nvidia or has_amd) else ""
@@ -1971,7 +2222,24 @@ class App:
                 await asyncio.to_thread(_sp.run, cmd)
 
             elif method == "docker" and gguf_file:
-                console.print("[warning]Docker launch requires manual execution — copy the command from the guide above.[/warning]")
+                if not shutil.which("docker"):
+                    console.print("[warning]docker not found in PATH. Install Docker first.[/warning]")
+                    return
+                img = "ghcr.io/ggerganov/llama.cpp:server-cuda" if has_nvidia else "ghcr.io/ggerganov/llama.cpp:server"
+                cmd = ["docker", "pull", img]
+                await asyncio.to_thread(_sp.run, cmd)
+                cmd = [
+                    "docker", "run", "--rm",
+                    "-p", "8080:8080",
+                    "-v", f"{gguf_dir}:/models:ro",
+                    img,
+                    "-m", f"/models/{Path(gguf_file).name}",
+                    "--host", "0.0.0.0", "--port", "8080", "-c", "4096",
+                ]
+                if has_nvidia:
+                    cmd[3:3] = ["--gpus", "all"]
+                console.print("[success]Server starting at http://localhost:8080/v1[/success]")
+                await asyncio.to_thread(_sp.run, cmd)
 
             else:
                 console.print(f"[warning]Auto-launch not supported for method '{method}'. Use the commands above.[/warning]")
@@ -2136,17 +2404,31 @@ class App:
         Await *coro* (a download coroutine) while printing a status line every 30 s
         so the user can confirm the process is alive during long downloads.
         """
+        started_at = time.monotonic()
+
+        def _fmt_elapsed(seconds: float) -> str:
+            total = int(seconds)
+            hours, rem = divmod(total, 3600)
+            minutes, secs = divmod(rem, 60)
+            if hours:
+                return f"{hours}h {minutes:02d}m {secs:02d}s"
+            return f"{minutes}m {secs:02d}s"
+
         async def _heartbeat() -> None:
-            elapsed = 0
             while True:
                 await asyncio.sleep(30)
-                elapsed += 30
-                m, s = divmod(elapsed, 60)
-                await self._log(f"[muted]  ... download still running ({m}m {s:02d}s elapsed)[/muted]")
+                elapsed = _fmt_elapsed(time.monotonic() - started_at)
+                await self._log(
+                    f"[muted]  ... download still running ({elapsed} elapsed). "
+                    "Leave this terminal open; the installer will continue automatically when it finishes.[/muted]"
+                )
 
         hb = asyncio.create_task(_heartbeat())
         try:
-            return await coro
+            result = await coro
+            elapsed = _fmt_elapsed(time.monotonic() - started_at)
+            await self._log(f"[success]Download task completed after {elapsed}.[/success]")
+            return result
         finally:
             hb.cancel()
             try:

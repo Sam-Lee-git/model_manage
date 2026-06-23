@@ -7,10 +7,24 @@ set -e
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Installing model-manager from ${REPO_DIR}"
-pip install -e "${REPO_DIR}" --quiet
+
+# Create venv if it doesn't exist, then install into it
+VENV_DIR="${REPO_DIR}/venv"
+VENV_PYTHON="${VENV_DIR}/bin/python"
+
+if [ ! -x "${VENV_PYTHON}" ]; then
+    python3 -m venv "${VENV_DIR}"
+fi
+
+# Use `python -m pip` instead of `venv/bin/pip`. Console scripts inside a
+# virtualenv can keep an old absolute shebang if the repo was moved.
+if ! "${VENV_PYTHON}" -m pip --version >/dev/null 2>&1; then
+    "${VENV_PYTHON}" -m ensurepip --upgrade
+fi
+"${VENV_PYTHON}" -m pip install -e "${REPO_DIR}" --quiet
 
 # Find where pip installed the mm script
-SCRIPTS_DIR="$(python -c "import sysconfig; print(sysconfig.get_path('scripts'))")"
+SCRIPTS_DIR="${VENV_DIR}/bin"
 MM_SCRIPT="${SCRIPTS_DIR}/mm"
 
 if [ ! -f "${MM_SCRIPT}" ]; then
